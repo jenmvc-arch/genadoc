@@ -1,0 +1,6 @@
+{
+  "framework": "vite",
+  "installCommand": "pnpm install --ignore-scripts",
+  "buildCommand": "pnpm build",
+  "outputDirectory": "dist"
+}
