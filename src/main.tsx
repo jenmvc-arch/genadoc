@@ -13,6 +13,7 @@ import {
   HeadingLevel,
 } from "docx";
 import { jsPDF } from "jspdf";
+import * as XLSX from "xlsx";
 import {
   AlignCenter,
   AlignJustify,
@@ -69,6 +70,10 @@ import {
   WandSparkles,
   X,
   Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Check,
+  Circle,
 } from "lucide-react";
 import "./styles.css";
 
@@ -82,6 +87,8 @@ type Clause = {
   included: boolean;
   tag: string;
   example?: boolean;
+  sourceClauseId?: string;
+  sourceClauseVersion?: number;
 };
 type Section = { id: string; title: string; clauses: Clause[] };
 type Template = {
@@ -156,6 +163,92 @@ type PromptRequest = {
   description?: string;
   value: string;
   oldKey?: string;
+};
+
+type WorkflowStage = "build" | "review" | "export";
+type AppModule = "workspace" | "clauses" | "placeholders" | "layouts" | "documents";
+type ClauseSubsection = { id: string; title: string; contents: Clause[]; collapsed?: boolean };
+type ClauseRecord = {
+  id: string;
+  title: string;
+  structure: "flat" | "nested";
+  subsections: ClauseSubsection[];
+  contents: Clause[];
+  category: string;
+  documentTypes: string[];
+  language: string;
+  tags: string[];
+  status: "draft" | "published" | "inactive";
+  version: number;
+  updatedAt: string;
+};
+type PlaceholderField = {
+  id: string;
+  key: string;
+  label: string;
+  type: "text" | "date" | "currency" | "number" | "select" | "multiline";
+  sourceField: string;
+  example: string;
+  required: boolean;
+  status: "active" | "inactive";
+  mappingStatus: "valid" | "invalid";
+  manualOverride: boolean;
+};
+type PlaceholderGroup = {
+  id: string;
+  name: string;
+  sourceType: string;
+  sourceTable?: string;
+  fields: PlaceholderField[];
+  status: "active" | "inactive";
+};
+type LayoutRecord = {
+  id: string;
+  name: string;
+  companyId: string;
+  letterhead: Letterhead;
+  status: "draft" | "published" | "inactive";
+  updatedAt: string;
+};
+type ExportRecord = {
+  id: string;
+  documentId: string;
+  versionId?: string;
+  format: "docx" | "pdf";
+  status: "generating" | "generated" | "failed";
+  fileName: string;
+  createdAt: string;
+  contentBase64?: string;
+  error?: string;
+};
+type DocumentRecord = {
+  id: string;
+  docName: string;
+  templateId?: string;
+  personId?: string;
+  companyId: string;
+  status: "draft" | "in-review" | "approved" | "void";
+  generationStatus: "not-generated" | "generating" | "generated" | "failed";
+  sections: Section[];
+  values: Record<string, string>;
+  letterhead: Letterhead;
+  versions: DocumentVersion[];
+  exports: ExportRecord[];
+  updatedAt: string;
+};
+type NavigationState = {
+  module: AppModule;
+  sidebarCollapsed: boolean;
+  filters: Record<string, Record<string, string>>;
+};
+type AppStore = {
+  schemaVersion: 1;
+  navigation: NavigationState;
+  clauses: ClauseRecord[];
+  placeholderGroups: PlaceholderGroup[];
+  layouts: LayoutRecord[];
+  documents: DocumentRecord[];
+  exports: ExportRecord[];
 };
 
 const formatDocumentStamp = (date = new Date()) => {
@@ -554,8 +647,160 @@ const dataUrlToBytes = (dataUrl?: string) => {
     return null;
   }
 };
+const blobToDataUrl = (blob: Blob) => new Promise<string>((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve(String(reader.result || ""));
+  reader.onerror = () => reject(reader.error || new Error("Could not read generated file"));
+  reader.readAsDataURL(blob);
+});
+const appStoreKey = "hr-doc-generator-app-store-v1";
+const navigationKey = "hr-doc-generator-navigation-v1";
+const companyId = "northstar-labs-my";
+const moduleFromHash = (hash: string): AppModule => {
+  const value = hash.replace(/^#/, "");
+  return (["workspace", "clauses", "placeholders", "layouts", "documents"] as AppModule[]).includes(value as AppModule)
+    ? (value as AppModule)
+    : "workspace";
+};
+const makeClauseRecord = (clause: Clause, template: Template, sectionTitle: string): ClauseRecord => ({
+  id: clause.id,
+  title: clause.title,
+  structure: "flat",
+  subsections: [],
+  contents: [{ ...clone(clause), title: sectionTitle ? `${sectionTitle} · ${clause.title}` : clause.title }],
+  category: sectionTitle,
+  documentTypes: [template.type],
+  language: "English",
+  tags: [clause.tag],
+  status: "published",
+  version: 1,
+  updatedAt: template.updated,
+});
+const makeDefaultPlaceholderGroups = (): PlaceholderGroup[] => {
+  const grouped = new Map<string, PlaceholderField[]>();
+  placeholderMeta.forEach(([key, label, source, group]) => {
+    const fields = grouped.get(group) || [];
+    fields.push({
+      id: key,
+      key,
+      label,
+      type: key.includes("date") ? "date" : key.includes("salary") || key.includes("fee") ? "currency" : "text",
+      sourceField: key,
+      example: people[1].fields[key] || people[0].fields[key] || "Example value",
+      required: ["full_name", "job_title", "start_date", "company_name"].includes(key),
+      status: "active",
+      mappingStatus: "valid",
+      manualOverride: false,
+    });
+    grouped.set(group, fields);
+  });
+  return Array.from(grouped.entries()).map(([name, fields]) => ({
+    id: `group-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+    name: name === "Person" ? "Employee details" : name === "Compensation" ? "Employment details" : name,
+    sourceType: "Onboarding Form",
+    sourceTable: "onboarding_submissions",
+    fields,
+    status: "active",
+  }));
+};
+const readAppStore = (): AppStore => {
+  const fallbackNavigation: NavigationState = {
+    module: moduleFromHash(typeof window === "undefined" ? "" : window.location.hash),
+    sidebarCollapsed: false,
+    filters: {},
+  };
+  try {
+    const stored = localStorage.getItem(appStoreKey);
+    if (stored) {
+      const parsed = JSON.parse(stored) as Partial<AppStore>;
+      return {
+        schemaVersion: 1,
+        navigation: { ...fallbackNavigation, ...(parsed.navigation || {}) },
+        clauses: parsed.clauses || [],
+        placeholderGroups: parsed.placeholderGroups || makeDefaultPlaceholderGroups(),
+        layouts: parsed.layouts || [],
+        documents: parsed.documents || [],
+        exports: parsed.exports || [],
+      };
+    }
+    const legacyRaw = localStorage.getItem(storageKey);
+    const legacy = legacyRaw ? JSON.parse(legacyRaw) : {};
+    const legacyTemplates: Template[] = legacy.templates || demoTemplates;
+    const legacySections: Section[] = legacy.sections || clone(demoTemplates[1].sections);
+    const legacyValues = legacy.values || clone(people[1].fields);
+    const legacyLetterhead = normalizeLetterhead(legacy.letterhead);
+    const clauses = legacyTemplates.flatMap((template) => template.sections.flatMap((section) => section.clauses.map((clause) => makeClauseRecord(clause, template, section.title))));
+    const layouts: LayoutRecord[] = [{
+      id: "layout-default",
+      name: "Northstar default letterhead",
+      companyId,
+      letterhead: legacyLetterhead,
+      status: "published",
+      updatedAt: formatDocumentStamp(),
+    }];
+    const document: DocumentRecord = {
+      id: "doc-current",
+      docName: legacy.docName || "Marcus Lee · Fixed-Term Agreement",
+      templateId: legacy.templateId || "fixed",
+      personId: legacy.personId || "EMP-2041",
+      companyId,
+      status: legacy.docStatus === "In review" ? "in-review" : legacy.docStatus === "Approved" ? "approved" : "draft",
+      generationStatus: "not-generated",
+      sections: legacySections,
+      values: legacyValues,
+      letterhead: legacyLetterhead,
+      versions: legacy.versions || [],
+      exports: [],
+      updatedAt: legacy.lastSavedAt || formatDocumentStamp(),
+    };
+    if (legacyRaw) {
+      localStorage.setItem(`${storageKey}-backup-${Date.now()}`, legacyRaw);
+    }
+    const migratedGroups = makeDefaultPlaceholderGroups();
+    const customGroupMap = new Map<string, PlaceholderField[]>();
+    (legacy.customPlaceholders || []).forEach((item: CustomPlaceholder) => {
+      const fields = customGroupMap.get(item.group) || [];
+      fields.push({ id: item.key, key: item.key, label: item.label, type: "text", sourceField: item.key, example: "Custom value", required: false, status: "active", mappingStatus: "valid", manualOverride: true });
+      customGroupMap.set(item.group, fields);
+    });
+    customGroupMap.forEach((fields, name) => migratedGroups.push({ id: `group-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`, name, sourceType: "Manual", sourceTable: "custom_fields", fields, status: "active" }));
+    const next: AppStore = {
+      schemaVersion: 1,
+      navigation: fallbackNavigation,
+      clauses,
+      placeholderGroups: migratedGroups,
+      layouts,
+      documents: [document],
+      exports: [],
+    };
+    localStorage.setItem(appStoreKey, JSON.stringify(next));
+    return next;
+  } catch {
+    return { schemaVersion: 1, navigation: fallbackNavigation, clauses: [], placeholderGroups: makeDefaultPlaceholderGroups(), layouts: [], documents: [], exports: [] };
+  }
+};
 
 function App() {
+  const [appStore, setAppStore] = useState<AppStore>(() => readAppStore());
+  const [activeModule, setActiveModule] = useState<AppModule>(() => moduleFromHash(window.location.hash));
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(navigationKey);
+      return saved ? Boolean(JSON.parse(saved).sidebarCollapsed) : false;
+    } catch {
+      return false;
+    }
+  });
+  const [moduleSearch, setModuleSearch] = useState("");
+  const [selectedClauseRecordId, setSelectedClauseRecordId] = useState<string | null>(null);
+  const [selectedPlaceholderGroupId, setSelectedPlaceholderGroupId] = useState<string | null>(null);
+  const [moduleDrawer, setModuleDrawer] = useState<"clause" | "placeholder" | "layout" | null>(null);
+  const [moduleNotice, setModuleNotice] = useState("");
+  const [moduleFilter, setModuleFilter] = useState("all");
+  const [clauseDraft, setClauseDraft] = useState<ClauseRecord | null>(null);
+  const [placeholderDraft, setPlaceholderDraft] = useState<PlaceholderGroup | null>(null);
+  const [layoutDraft, setLayoutDraft] = useState<LayoutRecord | null>(null);
+  const [importPreview, setImportPreview] = useState<{ fileName: string; headers: string[]; sample: Record<string, string>[] } | null>(null);
   const [templates, setTemplates] = useState<Template[]>(() => {
     const saved = localStorage.getItem(storageKey);
     return saved ? JSON.parse(saved).templates : demoTemplates;
@@ -572,6 +817,8 @@ function App() {
     ...makeDefaultLetterhead(),
   });
   const [letterheadEditorPage, setLetterheadEditorPage] = useState<"first" | "subsequent">("first");
+  const [workflowStage, setWorkflowStage] = useState<WorkflowStage>("build");
+  const [leftRailCollapsed, setLeftRailCollapsed] = useState(false);
   const [activeSection, setActiveSection] = useState("parties");
   const [activeClause, setActiveClause] = useState("fixed-1");
   const [activeRightTab, setActiveRightTab] = useState<
@@ -635,6 +882,8 @@ function App() {
   });
   const editorRef = useRef<HTMLDivElement>(null);
   const letterheadInputRef = useRef<HTMLInputElement>(null);
+  const placeholderImportInputRef = useRef<HTMLInputElement>(null);
+  const moduleDrawerRef = useRef<HTMLElement | null>(null);
   const activeEditorRef = useRef<HTMLDivElement | null>(null);
   const savedRangeRef = useRef<Range | null>(null);
   const versionCounterRef = useRef(0);
@@ -649,6 +898,47 @@ function App() {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem("hr-doc-generator-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    const onHashChange = () => setActiveModule(moduleFromHash(window.location.hash));
+    window.addEventListener("hashchange", onHashChange);
+    if (!window.location.hash) window.history.replaceState(null, "", "#workspace");
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  useEffect(() => {
+    if (!moduleDrawer) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setModuleDrawer(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.setTimeout(() => moduleDrawerRef.current?.focus(), 0);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [moduleDrawer]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(navigationKey, JSON.stringify({
+        module: activeModule,
+        sidebarCollapsed,
+        filters: appStore.navigation.filters,
+      } satisfies NavigationState));
+      setAppStore((current) => ({
+        ...current,
+        navigation: { ...current.navigation, module: activeModule, sidebarCollapsed },
+      }));
+    } catch {
+      setModuleNotice("Navigation preference could not be saved");
+    }
+  }, [activeModule, sidebarCollapsed]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(appStoreKey, JSON.stringify(appStore));
+    } catch {
+      setModuleNotice("Some module changes could not be saved in browser storage");
+    }
+  }, [appStore]);
 
   const template =
     templates.find((item) => item.id === templateId) || templates[1];
@@ -775,6 +1065,7 @@ function App() {
         setSections(state.sections || clone(demoTemplates[1].sections));
         setDocName(state.docName || "Marcus Lee · Fixed-Term Agreement");
         setDocStatus(state.docStatus || "Draft");
+        setWorkflowStage(state.workflowStage || "build");
         setCustomPlaceholders(state.customPlaceholders || []);
         setCurrentRole(state.currentRole || "Admin");
         setConnectionStatus(state.connectionStatus || "Connected");
@@ -814,6 +1105,7 @@ function App() {
               sections,
               docName,
               docStatus,
+              workflowStage,
               customPlaceholders,
               currentRole,
               connectionStatus,
@@ -848,6 +1140,7 @@ function App() {
     sections,
     docName,
     docStatus,
+    workflowStage,
     customPlaceholders,
     currentRole,
     connectionStatus,
@@ -1625,6 +1918,81 @@ function App() {
     return issues;
   }, [letterhead, person.id, person.name, person.role, personId, sections, templateId, values]);
   const blockingIssues = documentIssues;
+  const workflowSummary = useMemo(() => {
+    if (docStatus === "Approved") {
+      return {
+        stage: "export" as WorkflowStage,
+        targetStage: "export" as WorkflowStage,
+        title: "Approved and ready to export",
+        detail: "This version is locked. Export the approved copy or restore it as a new draft.",
+        tone: "success" as const,
+        action: "Open export",
+      };
+    }
+    if (docStatus === "In review") {
+      return {
+        stage: "review" as WorkflowStage,
+        targetStage: "review" as WorkflowStage,
+        title: "Waiting for review",
+        detail: currentRole === "Reviewer" ? "Review the checks below, then approve this version." : "An editor has submitted this version for approval.",
+        tone: "review" as const,
+        action: currentRole === "Reviewer" ? "Open review" : "View submission",
+      };
+    }
+    if (blockingIssues.length) {
+      return {
+        stage: "build" as WorkflowStage,
+        targetStage: "review" as WorkflowStage,
+        title: `${blockingIssues.length} item${blockingIssues.length === 1 ? "" : "s"} to resolve`,
+        detail: "Finish the highlighted fields and layout checks before sending this document for review.",
+        tone: "warning" as const,
+        action: "Review checks",
+      };
+    }
+    if (workflowStage === "review") {
+      return {
+        stage: "review" as WorkflowStage,
+        targetStage: "build" as WorkflowStage,
+        title: "Review this draft",
+        detail: "Check required fields, clause inclusion and the final page layout before submission.",
+        tone: "review" as const,
+        action: "Back to build",
+      };
+    }
+    if (workflowStage === "export") {
+      return {
+        stage: "export" as WorkflowStage,
+        targetStage: "export" as WorkflowStage,
+        title: "Export this draft",
+        detail: "The preview is the final source of truth for Word and PDF output.",
+        tone: "ready" as const,
+        action: "Open export",
+      };
+    }
+    return {
+      stage: "build" as WorkflowStage,
+      targetStage: "review" as WorkflowStage,
+      title: "Ready for review",
+      detail: "Source data, clauses and layout checks are complete.",
+      tone: "ready" as const,
+      action: "Open preview",
+    };
+  }, [blockingIssues.length, currentRole, docStatus, workflowStage]);
+  const effectiveWorkflowStage: WorkflowStage = docStatus === "Approved"
+    ? "export"
+    : docStatus === "In review"
+      ? "review"
+      : workflowStage;
+  const workflowStageIndex = effectiveWorkflowStage === "build" ? 0 : effectiveWorkflowStage === "review" ? 1 : 2;
+  const goToWorkflowStage = (stage: WorkflowStage) => {
+    setWorkflowStage(stage);
+    if (stage === "build") {
+      setActiveRightTab("person");
+      setShowPreview(false);
+      return;
+    }
+    setShowPreview(true);
+  };
   const openNewBlankDocument = () => {
     if (!guardEdit()) return;
     const id = `blank-${Date.now()}`;
@@ -2077,14 +2445,17 @@ function App() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.docx`;
+      const fileName = `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.docx`;
+      a.download = fileName;
       a.click();
       URL.revokeObjectURL(url);
+      recordExport("docx", "generated", fileName, undefined, await blobToDataUrl(blob));
       setExportState("idle");
       setToast("Word document exported");
     } catch (error) {
       setExportState("error");
       setExportError(`Word export failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+      recordExport("docx", "failed", `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.docx`, error instanceof Error ? error.message : "Unknown error");
       setToast("Word export failed. Retry after resolving the error.");
     }
     window.setTimeout(() => setToast(""), 2600);
@@ -2156,12 +2527,16 @@ function App() {
       pdf.setFont("helvetica", "normal");
       pdf.text("Employee / Contractor signature: ______________________________", 54, y + 48);
       pdf.text("Date: ____________________", 54, y + 68);
-      pdf.save(`${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.pdf`);
+      const fileName = `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.pdf`;
+      const pdfContentBase64 = await blobToDataUrl(pdf.output("blob"));
+      pdf.save(fileName);
+      recordExport("pdf", "generated", fileName, undefined, pdfContentBase64);
       setExportState("idle");
       setToast("PDF exported");
     } catch (error) {
       setExportState("error");
       setExportError(`PDF export failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+      recordExport("pdf", "failed", `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.pdf`, error instanceof Error ? error.message : "Unknown error");
       setToast("PDF export failed. Retry after resolving the error.");
     }
     window.setTimeout(() => setToast(""), 2600);
@@ -2183,9 +2558,291 @@ function App() {
     ["Letterheads", "2 saved", ImagePlus],
     ["Rules", "9 active · 1 draft", WandSparkles],
   ];
+  const navItems: Array<[AppModule, string, React.ComponentType<{ size?: number }>]> = [
+    ["workspace", "Workspace", FileText],
+    ["clauses", "Clauses Library", Archive],
+    ["placeholders", "Placeholder Management", Sparkles],
+    ["layouts", "Layout Management", ImagePlus],
+    ["documents", "Document Library", FolderOpen],
+  ];
+  const currentDocumentRecord = (): DocumentRecord => ({
+    id: "doc-current",
+    docName,
+    templateId,
+    personId,
+    companyId,
+    status: docStatus === "In review" ? "in-review" : docStatus === "Approved" ? "approved" : "draft",
+    generationStatus: appStore.documents.find((item) => item.id === "doc-current")?.generationStatus || "not-generated",
+    sections: clone(sections),
+    values: clone(values),
+    letterhead: clone(letterhead),
+    versions: clone(versions),
+    exports: clone(appStore.documents.find((item) => item.id === "doc-current")?.exports || []),
+    updatedAt: formatDocumentStamp(),
+  });
+  const persistCurrentDocumentRecord = () => {
+    try {
+      const record = currentDocumentRecord();
+      const next: AppStore = {
+        ...appStore,
+        navigation: { ...appStore.navigation, module: activeModule, sidebarCollapsed },
+        documents: [record, ...appStore.documents.filter((item) => item.id !== record.id)],
+      };
+      localStorage.setItem(appStoreKey, JSON.stringify(next));
+      setAppStore(next);
+      return true;
+    } catch {
+      setSaving("error");
+      setModuleNotice("Save failed. Retry or stay on this page.");
+      return false;
+    }
+  };
+  const switchModule = (module: AppModule) => {
+    if (module === activeModule) return;
+    if (activeModule === "workspace" && !persistCurrentDocumentRecord()) return;
+    window.location.hash = module;
+    setActiveModule(module);
+  };
+  const moduleTitle = navItems.find(([id]) => id === activeModule)?.[1] || "Workspace";
+  const filteredClauses = appStore.clauses.filter((clause) => {
+    const matchesSearch = !moduleSearch || `${clause.title} ${clause.category} ${clause.tags.join(" ")}`.toLowerCase().includes(moduleSearch.toLowerCase());
+    const matchesFilter = moduleFilter === "all" || clause.status === moduleFilter;
+    return matchesSearch && matchesFilter;
+  });
+  const selectedGroup = appStore.placeholderGroups.find((group) => group.id === (selectedPlaceholderGroupId || appStore.placeholderGroups[0]?.id));
+  const updateClauseDraft = (patch: Partial<ClauseRecord>) => setClauseDraft((current) => current ? { ...current, ...patch, updatedAt: formatDocumentStamp() } : current);
+  const saveClauseDraft = (publish = false) => {
+    if (!clauseDraft || currentRole !== "Admin" && publish) return;
+    const nextClause = { ...clauseDraft, status: publish ? "published" : clauseDraft.status, version: clauseDraft.version + (publish ? 1 : 0), updatedAt: formatDocumentStamp() } as ClauseRecord;
+    setAppStore((current) => ({ ...current, clauses: [nextClause, ...current.clauses.filter((item) => item.id !== nextClause.id)] }));
+    setSelectedClauseRecordId(nextClause.id);
+    setClauseDraft(null);
+    setModuleDrawer(null);
+    setModuleNotice(publish ? "Clause published for new documents" : "Clause draft saved");
+  };
+  const openClauseEditor = (record?: ClauseRecord) => {
+    const next = record ? clone(record) : {
+      id: `clause-${Date.now()}`,
+      title: "New clause",
+      structure: "flat" as const,
+      subsections: [],
+      contents: [{ id: `content-${Date.now()}`, title: "Content block", text: "Add clause text here.", included: true, tag: "Core" }],
+      category: "General",
+      documentTypes: [template.type],
+      language: "English",
+      tags: ["Draft"],
+      status: "draft" as const,
+      version: 1,
+      updatedAt: formatDocumentStamp(),
+    };
+    setClauseDraft(next);
+    setModuleDrawer("clause");
+  };
+  const addClauseContent = (subsectionId?: string) => {
+    if (!clauseDraft) return;
+    const item: Clause = { id: `content-${Date.now()}`, title: "New content block", text: "Write reusable content here.", included: true, tag: "Core" };
+    if (clauseDraft.structure === "nested" && subsectionId) {
+      updateClauseDraft({ subsections: clauseDraft.subsections.map((sub) => sub.id === subsectionId ? { ...sub, contents: [...sub.contents, item] } : sub) });
+    } else updateClauseDraft({ contents: [...clauseDraft.contents, item] });
+  };
+  const copyClauseRecord = (record: ClauseRecord) => {
+    const copy = { ...clone(record), id: `clause-${Date.now()}`, title: `${record.title} copy`, status: "draft" as const, version: 1, updatedAt: formatDocumentStamp() };
+    setAppStore((current) => ({ ...current, clauses: [copy, ...current.clauses] }));
+    setModuleNotice("Clause copied as a draft");
+  };
+  const toggleClauseStatus = (record: ClauseRecord) => {
+    if (currentRole !== "Admin") return setModuleNotice("Admin role required to change clause status");
+    setAppStore((current) => ({ ...current, clauses: current.clauses.map((item) => item.id === record.id ? { ...item, status: item.status === "inactive" ? "published" : "inactive", updatedAt: formatDocumentStamp() } : item) }));
+  };
+  const openPlaceholderEditor = (group?: PlaceholderGroup) => {
+    setPlaceholderDraft(group ? clone(group) : { id: `group-${Date.now()}`, name: "New placeholder group", sourceType: "Manual", sourceTable: "custom_fields", fields: [], status: "active" });
+    setModuleDrawer("placeholder");
+  };
+  const addPlaceholderField = () => setPlaceholderDraft((current) => current ? { ...current, fields: [...current.fields, { id: `field-${Date.now()}`, key: `custom_${current.fields.length + 1}`, label: "New field", type: "text", sourceField: "", example: "Example value", required: false, status: "active", mappingStatus: "valid", manualOverride: true }] } : current);
+  const previewPlaceholderImport = async (file?: File) => {
+    if (!file) return;
+    try {
+      const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
+      const sheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" });
+      const headers = rows.length ? Object.keys(rows[0]) : [];
+      const sample = rows.slice(0, 3).map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, String(value)])));
+      setImportPreview({ fileName: file.name, headers, sample });
+      setPlaceholderDraft((current) => current ? { ...current, sourceType: file.name.toLowerCase().endsWith(".csv") ? "CSV import" : "Excel workbook", sourceTable: sheetName } : current);
+      setModuleNotice(`${file.name} loaded for preview. Confirm the fields before saving.`);
+    } catch {
+      setModuleNotice("Import preview failed. Use a CSV or Excel workbook with a header row.");
+    }
+  };
+  const confirmPlaceholderImport = () => {
+    if (!importPreview) return;
+    setPlaceholderDraft((current) => current ? { ...current, fields: importPreview.headers.map((header, index) => ({ id: `${current.id}-${header}-${index}`, key: header.toLowerCase().replace(/[^a-z0-9]+/g, "_"), label: header, type: "text", sourceField: header, example: importPreview.sample[0]?.[header] || "", required: false, status: "active", mappingStatus: "valid", manualOverride: false })) } : current);
+    setImportPreview(null);
+    setModuleNotice("Imported fields added to this placeholder group. Review and save the group.");
+  };
+  const savePlaceholderDraft = () => {
+    if (!placeholderDraft) return;
+    setAppStore((current) => ({ ...current, placeholderGroups: [placeholderDraft, ...current.placeholderGroups.filter((item) => item.id !== placeholderDraft.id)] }));
+    setSelectedPlaceholderGroupId(placeholderDraft.id);
+    setPlaceholderDraft(null);
+    setModuleDrawer(null);
+    setModuleNotice("Placeholder group saved");
+  };
+  const openLayoutEditor = (record?: LayoutRecord) => {
+    setLayoutDraft(record ? clone(record) : { id: `layout-${Date.now()}`, name: "New letterhead", companyId, letterhead: makeDefaultLetterhead(), status: "draft", updatedAt: formatDocumentStamp() });
+    setModuleDrawer("layout");
+  };
+  const saveLayoutDraft = (publish = false) => {
+    if (!layoutDraft) return;
+    const next = { ...layoutDraft, status: publish ? "published" : layoutDraft.status, updatedAt: formatDocumentStamp() } as LayoutRecord;
+    setAppStore((current) => ({ ...current, layouts: [next, ...current.layouts.filter((item) => item.id !== next.id)] }));
+    setLayoutDraft(null);
+    setModuleDrawer(null);
+    setModuleNotice(publish ? "Layout published" : "Layout saved");
+  };
+  const applyLayoutRecord = (record: LayoutRecord) => {
+    if (!guardEdit()) return;
+    setLetterhead(normalizeLetterhead(record.letterhead));
+    setActiveRightTab("letterhead");
+    setModuleNotice(`${record.name} applied to this document snapshot`);
+  };
+  const insertClauseRecord = (record: ClauseRecord) => {
+    if (!guardEdit()) return;
+    const sourceClauses = record.structure === "nested"
+      ? record.subsections.flatMap((subsection) => subsection.contents)
+      : record.contents;
+    const insertedClauses = sourceClauses.map((clause) => ({
+      ...clone(clause),
+      id: `${record.id}-${clause.id}-${Date.now()}`,
+      tag: "Library",
+      included: true,
+      sourceClauseId: record.id,
+      sourceClauseVersion: record.version,
+    }));
+    const section: Section = {
+      id: `library-section-${Date.now()}`,
+      title: record.title,
+      clauses: insertedClauses,
+    };
+    setSections((current) => [...current, section]);
+    setActiveSection(section.id);
+    setActiveClause(insertedClauses[0]?.id || "");
+    setModuleNotice(`${record.title} inserted as a document copy`);
+    switchModule("workspace");
+  };
+  const recordExport = (format: ExportRecord["format"], status: ExportRecord["status"], fileName: string, error?: string, contentBase64?: string) => {
+    const exportRecord: ExportRecord = {
+      id: `export-${Date.now()}-${format}`,
+      documentId: "doc-current",
+      versionId: versions[0]?.id,
+      format,
+      status,
+      fileName,
+      createdAt: formatDocumentStamp(),
+      contentBase64,
+      error,
+    };
+    setAppStore((current) => {
+      const existing = current.documents.find((item) => item.id === "doc-current") || currentDocumentRecord();
+      const nextDocument: DocumentRecord = {
+        ...existing,
+        sections: clone(sections),
+        values: clone(values),
+        letterhead: clone(letterhead),
+        docName,
+        templateId,
+        personId,
+        status: docStatus === "In review" ? "in-review" : docStatus === "Approved" ? "approved" : "draft",
+        generationStatus: status === "generated" ? "generated" : "failed",
+        exports: status === "failed" ? existing.exports : [exportRecord, ...existing.exports],
+        updatedAt: formatDocumentStamp(),
+      };
+      return { ...current, exports: [exportRecord, ...current.exports], documents: [nextDocument, ...current.documents.filter((item) => item.id !== "doc-current")] };
+    });
+  };
+  const formatDocStatus = (status: DocumentRecord["status"]) => status === "in-review" ? "In review" : status.charAt(0).toUpperCase() + status.slice(1);
+  const downloadStoredExport = (record: DocumentRecord, format: ExportRecord["format"]) => {
+    const exportRecord = record.exports.find((item) => item.format === format && item.status === "generated" && item.contentBase64);
+    if (!exportRecord?.contentBase64) {
+      setModuleNotice(`No stored ${format.toUpperCase()} file is available. Regenerate from Workspace.`);
+      return;
+    }
+    const bytes = dataUrlToBytes(exportRecord.contentBase64);
+    if (!bytes) return setModuleNotice("Stored file could not be read. Regenerate from Workspace.");
+    const blob = new Blob([bytes], { type: format === "pdf" ? "application/pdf" : "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = exportRecord.fileName;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+  const renderModulePage = () => {
+    if (activeModule === "clauses") {
+      return <section className="module-page">
+        <div className="module-header"><div><span className="eyebrow">CONTENT SYSTEM</span><h1>Clauses Library</h1><p>Maintain reusable, versioned content without changing existing document copies.</p></div><button className="primary-btn" onClick={() => openClauseEditor()}><Plus size={15} /> New clause</button></div>
+        <div className="module-toolbar"><label className="module-search"><Search size={15} /><input value={moduleSearch} onChange={(e) => setModuleSearch(e.target.value)} placeholder="Search clauses" /></label><select value={moduleFilter} onChange={(e) => setModuleFilter(e.target.value)}><option value="all">All statuses</option><option value="published">Published</option><option value="draft">Draft</option><option value="inactive">Inactive</option></select><span className="module-count">{filteredClauses.length} clauses</span></div>
+        <div className="library-table"><div className="library-table-head"><span>Clause</span><span>Structure</span><span>Use</span><span>Status</span><span>Actions</span></div>{filteredClauses.map((record) => <div className="library-row" key={record.id}><div><strong>{record.title}</strong><small>{record.category} · {record.language} · v{record.version}</small></div><span>{record.structure === "nested" ? `${record.subsections.length} subsections` : "Flat"}</span><span>{record.contents.length + record.subsections.reduce((count, sub) => count + sub.contents.length, 0)} content blocks</span><span className={`status-pill ${record.status}`}>{record.status}</span><div className="row-actions"><button className="icon-btn" title="Edit" onClick={() => openClauseEditor(record)}><Settings2 size={14} /></button><button className="icon-btn" title="Copy" onClick={() => copyClauseRecord(record)}><Copy size={14} /></button><button className="icon-btn" title="Preview" onClick={() => { setSelectedClauseRecordId(record.id); setModuleNotice("Preview loaded below"); }}><FileCheck2 size={14} /></button><button className="icon-btn" title={record.status === "inactive" ? "Activate" : "Deactivate"} onClick={() => toggleClauseStatus(record)}><Archive size={14} /></button></div></div>)}</div>
+        {selectedClauseRecordId && <div className="module-preview"><div><div><span className="eyebrow">PREVIEW</span><h3>{appStore.clauses.find((item) => item.id === selectedClauseRecordId)?.title}</h3></div><div className="row-actions"><button className="primary-btn" onClick={() => { const record = appStore.clauses.find((item) => item.id === selectedClauseRecordId); if (record) insertClauseRecord(record); }}><Plus size={14} /> Insert in Workspace</button><button className="icon-btn" onClick={() => setSelectedClauseRecordId(null)}><X size={15} /></button></div></div><div className="preview-outline">{(() => { const record = appStore.clauses.find((item) => item.id === selectedClauseRecordId); if (!record) return null; return <>{record.structure === "nested" ? record.subsections.map((sub, index) => <div key={sub.id}><strong>{index + 1}. {sub.title}</strong>{sub.contents.map((item, itemIndex) => <p key={item.id}>{index + 1}.{itemIndex + 1} {item.text}</p>)}</div>) : record.contents.map((item, index) => <p key={item.id}>{index + 1}. {item.text}</p>)}</>; })()}</div></div>}
+      </section>;
+    }
+    if (activeModule === "placeholders") {
+      return <section className="module-page"><div className="module-header"><div><span className="eyebrow">DATA MODEL</span><h1>Placeholder Management</h1><p>Map reusable fields to onboarding and company records with stable IDs.</p></div><button className="primary-btn" onClick={() => openPlaceholderEditor()}><Plus size={15} /> New group</button></div><div className="split-module"><aside className="module-list">{appStore.placeholderGroups.map((group) => <button className={selectedGroup?.id === group.id ? "selected" : ""} key={group.id} onClick={() => setSelectedPlaceholderGroupId(group.id)}><span>{group.name}</span><small>{group.fields.length} fields · {group.sourceType}</small></button>)}</aside><div className="module-detail">{selectedGroup ? <><div className="detail-heading"><div><h2>{selectedGroup.name}</h2><span>{selectedGroup.sourceType} · {selectedGroup.sourceTable}</span></div><div className="row-actions"><button className="outline-btn" onClick={() => openPlaceholderEditor(selectedGroup)}><Settings2 size={14} /> Edit group</button><button className="primary-btn" onClick={() => { setPlaceholderDraft(clone(selectedGroup)); addPlaceholderField(); setModuleDrawer("placeholder"); }}><Plus size={14} /> Add field</button></div></div><div className="field-table"><div className="field-table-head"><span>Name</span><span>Placeholder</span><span>Type</span><span>Source</span><span>Example</span><span>Status</span></div>{selectedGroup.fields.map((field) => <div className="field-table-row" key={field.id}><strong>{field.label}</strong><code>{`{{${selectedGroup.name}.${field.label}}}`}</code><span>{field.type}</span><span>{field.sourceField || "Manual"}</span><span>{field.example}</span><span className={`status-pill ${field.mappingStatus === "valid" ? "published" : "inactive"}`}>{field.mappingStatus === "valid" ? "Connected" : "Mapping invalid"}</span></div>)}</div></> : <div className="empty-state"><Sparkles size={18} /> Create a placeholder group to get started.</div>}</div></div></section>;
+    }
+    if (activeModule === "layouts") {
+      return <section className="module-page"><div className="module-header"><div><span className="eyebrow">PAGE SYSTEM</span><h1>Layout Management</h1><p>Keep company letterheads and page safety settings reusable, previewable, and versioned.</p></div><div className="row-actions"><button className="outline-btn" onClick={() => openLayoutEditor()}><Plus size={15} /> Create letterhead</button><button className="primary-btn" onClick={() => { letterheadInputRef.current?.click(); }}><Upload size={15} /> Upload existing</button></div></div><div className="layout-grid">{appStore.layouts.map((record) => <article className="layout-card" key={record.id}><div className="layout-thumb" style={{ borderTopColor: record.letterhead.accent }}><div className="layout-thumb-brand"><span style={{ background: record.letterhead.accent }}>N</span><strong>{values.company_name || "Northstar Labs"}</strong></div><div className="layout-thumb-lines" /></div><div className="layout-card-body"><div><strong>{record.name}</strong><small>{record.letterhead.page} · {record.status} · updated {record.updatedAt}</small></div><div className="row-actions"><button className="icon-btn" title="Apply to workspace" onClick={() => { applyLayoutRecord(record); switchModule("workspace"); }}><Check size={14} /></button><button className="icon-btn" title="Edit" onClick={() => openLayoutEditor(record)}><Settings2 size={14} /></button><button className="icon-btn" title="Copy" onClick={() => setAppStore((current) => ({ ...current, layouts: [{ ...clone(record), id: `layout-${Date.now()}`, name: `${record.name} copy`, status: "draft" }, ...current.layouts] }))}><Copy size={14} /></button></div></div></article>)}</div></section>;
+    }
+    if (activeModule === "documents") {
+      const docs = appStore.documents.filter((doc) => {
+        const matchesSearch = !moduleSearch || `${doc.docName} ${doc.personId}`.toLowerCase().includes(moduleSearch.toLowerCase());
+        const matchesFilter = moduleFilter === "all" || (moduleFilter === "generated" ? doc.generationStatus === "generated" : doc.status === moduleFilter);
+        return matchesSearch && matchesFilter;
+      });
+      return <section className="module-page"><div className="module-header"><div><span className="eyebrow">FILES & VERSIONS</span><h1>Document Library</h1><p>Saved records, approval states, and generated files stay connected.</p></div><button className="primary-btn" onClick={() => switchModule("workspace")}><Plus size={15} /> New document</button></div><div className="module-toolbar"><label className="module-search"><Search size={15} /><input value={moduleSearch} onChange={(e) => setModuleSearch(e.target.value)} placeholder="Search documents" /></label><select value={moduleFilter} onChange={(e) => setModuleFilter(e.target.value)}><option value="all">All documents</option><option value="draft">Drafts</option><option value="in-review">In review</option><option value="approved">Approved</option><option value="generated">Generated</option></select></div><div className="library-table"><div className="library-table-head"><span>Document</span><span>Person</span><span>Saved status</span><span>Generation</span><span>Actions</span></div>{docs.length ? docs.map((doc) => <div className="library-row" key={doc.id}><div><strong>{doc.docName}</strong><small>{templates.find((item) => item.id === doc.templateId)?.type || "HR document"} · v{doc.versions.length || 1} · {doc.exports.length} export{doc.exports.length === 1 ? "" : "s"}</small></div><span>{people.find((item) => item.id === doc.personId)?.name || doc.personId || "Unassigned"}</span><span className={`status-pill ${doc.status}`}>{formatDocStatus(doc.status)}</span><span className={`status-pill ${doc.generationStatus === "generated" ? "published" : doc.generationStatus === "failed" ? "inactive" : "draft"}`}>{doc.generationStatus}</span><div className="row-actions"><button className="outline-btn" onClick={() => { switchModule("workspace"); }}>Open</button>{doc.exports.some((item) => item.format === "docx" && item.status === "generated") && <button className="icon-btn" title="Download Word" onClick={() => downloadStoredExport(doc, "docx")}><Download size={14} /></button>}{doc.exports.some((item) => item.format === "pdf" && item.status === "generated") && <button className="icon-btn" title="Download PDF" onClick={() => downloadStoredExport(doc, "pdf")}><FileCheck2 size={14} /></button>}<button className="icon-btn" title="Copy as new" onClick={() => { setDocName(`${doc.docName} copy`); switchModule("workspace"); }}><Copy size={14} /></button></div></div>) : <div className="empty-state"><FolderOpen size={18} /> No saved documents yet.</div>}</div></section>;
+    }
+    return null;
+  };
+  const renderModuleDrawer = () => {
+    if (!moduleDrawer) return null;
+    if (moduleDrawer === "clause" && clauseDraft) {
+      return <div className="module-drawer-backdrop" onClick={() => setModuleDrawer(null)}><aside className="module-drawer" onClick={(event) => event.stopPropagation()}><div className="drawer-heading"><div><span className="eyebrow">CLAUSE EDITOR · 1–4</span><h2>{clauseDraft.title || "New clause"}</h2><p>Build a reusable clause without changing document copies already in use.</p></div><button className="icon-btn" onClick={() => setModuleDrawer(null)}><X size={17} /></button></div><div className="drawer-steps"><span className="active">1 Details</span><span>2 Structure</span><span>3 Content</span><span>4 Preview</span></div><label className="drawer-field"><span>Primary title</span><input value={clauseDraft.title} onChange={(e) => updateClauseDraft({ title: e.target.value })} /></label><div className="drawer-grid"><label className="drawer-field"><span>Category</span><input value={clauseDraft.category} onChange={(e) => updateClauseDraft({ category: e.target.value })} /></label><label className="drawer-field"><span>Language</span><select value={clauseDraft.language} onChange={(e) => updateClauseDraft({ language: e.target.value })}><option>English</option><option>中文</option><option>Bahasa Melayu</option></select></label></div><label className="drawer-field"><span>Structure</span><div className="segmented-control"><button className={clauseDraft.structure === "flat" ? "active" : ""} onClick={() => updateClauseDraft({ structure: "flat" })}>Flat content</button><button className={clauseDraft.structure === "nested" ? "active" : ""} onClick={() => updateClauseDraft({ structure: "nested" })}>Nested subsections</button></div></label><div className="drawer-section-heading"><div><strong>Content blocks</strong><small>{clauseDraft.structure === "nested" ? "Organise content under subsections." : "Add content directly under the primary title."}</small></div><button className="add-field" onClick={() => addClauseContent()}><Plus size={14} /> Add content</button></div>{clauseDraft.structure === "nested" ? <div className="drawer-subsections">{clauseDraft.subsections.map((subsection, index) => <div className="drawer-subsection" key={subsection.id}><div className="drawer-subsection-head"><input value={subsection.title} onChange={(e) => updateClauseDraft({ subsections: clauseDraft.subsections.map((item) => item.id === subsection.id ? { ...item, title: e.target.value } : item) })} /><div className="row-actions"><button className="icon-btn" title="Move up" onClick={() => updateClauseDraft({ subsections: clauseDraft.subsections.map((item, itemIndex, items) => itemIndex === index && index > 0 ? items[index - 1] : itemIndex === index - 1 ? items[index] : item) })}><ArrowUp size={13} /></button><button className="icon-btn" title="Move down" onClick={() => updateClauseDraft({ subsections: clauseDraft.subsections.map((item, itemIndex, items) => itemIndex === index && index < items.length - 1 ? items[index + 1] : itemIndex === index + 1 ? items[index] : item) })}><ArrowDown size={13} /></button></div></div>{subsection.contents.map((item) => <textarea key={item.id} value={item.text} onChange={(e) => updateClauseDraft({ subsections: clauseDraft.subsections.map((group) => group.id === subsection.id ? { ...group, contents: group.contents.map((content) => content.id === item.id ? { ...content, text: e.target.value } : content) } : group) })} />)}<button className="text-btn" onClick={() => addClauseContent(subsection.id)}><Plus size={13} /> Add content to subsection</button></div>)}<button className="add-field" onClick={() => updateClauseDraft({ subsections: [...clauseDraft.subsections, { id: `sub-${Date.now()}`, title: "New subsection", contents: [] }] })}><Plus size={14} /> Add subsection</button></div> : <div className="drawer-contents">{clauseDraft.contents.map((item, index) => <div className="drawer-content-row" key={item.id}><span>{index + 1}</span><textarea value={item.text} onChange={(e) => updateClauseDraft({ contents: clauseDraft.contents.map((content) => content.id === item.id ? { ...content, text: e.target.value } : content) })} /><div className="row-actions"><button className="icon-btn" title="Move up" onClick={() => updateClauseDraft({ contents: clauseDraft.contents.map((content, itemIndex, items) => itemIndex === index && index > 0 ? items[index - 1] : itemIndex === index - 1 ? items[index] : content) })}><ArrowUp size={13} /></button><button className="icon-btn" title="Move down" onClick={() => updateClauseDraft({ contents: clauseDraft.contents.map((content, itemIndex, items) => itemIndex === index && index < items.length - 1 ? items[index + 1] : itemIndex === index + 1 ? items[index] : content) })}><ArrowDown size={13} /></button><button className="icon-btn" title="Delete" onClick={() => updateClauseDraft({ contents: clauseDraft.contents.filter((content) => content.id !== item.id) })}><Trash2 size={13} /></button></div></div>)}</div>}<div className="drawer-footer"><button className="outline-btn" onClick={() => { setClauseDraft(null); setModuleDrawer(null); }}>Cancel</button><button className="outline-btn" onClick={() => saveClauseDraft(false)}><Save size={14} /> Save draft</button><button className="primary-btn" disabled={currentRole !== "Admin"} onClick={() => saveClauseDraft(true)}><ShieldCheck size={14} /> Publish</button></div></aside></div>;
+    }
+    if (moduleDrawer === "placeholder" && placeholderDraft) {
+      return <div className="module-drawer-backdrop" onClick={() => setModuleDrawer(null)}><aside className="module-drawer" onClick={(event) => event.stopPropagation()}><div className="drawer-heading"><div><span className="eyebrow">PLACEHOLDER GROUP</span><h2>{placeholderDraft.name}</h2><p>Stable field IDs keep existing references working when display labels change.</p></div><button className="icon-btn" onClick={() => setModuleDrawer(null)}><X size={17} /></button></div><label className="drawer-field"><span>Group name</span><input value={placeholderDraft.name} onChange={(e) => setPlaceholderDraft({ ...placeholderDraft, name: e.target.value })} /></label><div className="drawer-grid"><label className="drawer-field"><span>Source type</span><select value={placeholderDraft.sourceType} onChange={(e) => setPlaceholderDraft({ ...placeholderDraft, sourceType: e.target.value })}><option>Onboarding Form</option><option>CSV import</option><option>Excel workbook</option><option>Manual</option></select></label><label className="drawer-field"><span>Source table / sheet</span><input value={placeholderDraft.sourceTable || ""} onChange={(e) => setPlaceholderDraft({ ...placeholderDraft, sourceTable: e.target.value })} /></label></div><div className="drawer-section-heading"><div><strong>Fields</strong><small>{placeholderDraft.fields.length} reusable fields</small></div><button className="add-field" onClick={addPlaceholderField}><Plus size={14} /> Add field</button></div><div className="drawer-field-list">{placeholderDraft.fields.map((field, index) => <div className="drawer-field-card" key={field.id}><input value={field.label} aria-label={`Field ${index + 1} name`} onChange={(e) => setPlaceholderDraft({ ...placeholderDraft, fields: placeholderDraft.fields.map((item) => item.id === field.id ? { ...item, label: e.target.value } : item) })} /><code>{`{{${placeholderDraft.name}.${field.label}}}`}</code><select value={field.type} onChange={(e) => setPlaceholderDraft({ ...placeholderDraft, fields: placeholderDraft.fields.map((item) => item.id === field.id ? { ...item, type: e.target.value as PlaceholderField["type"] } : item) })}><option value="text">Text</option><option value="date">Date</option><option value="currency">Currency</option><option value="number">Number</option><option value="multiline">Multiline</option></select><input value={field.sourceField} placeholder="Source field" onChange={(e) => setPlaceholderDraft({ ...placeholderDraft, fields: placeholderDraft.fields.map((item) => item.id === field.id ? { ...item, sourceField: e.target.value } : item) })} /><button className="icon-btn" onClick={() => setPlaceholderDraft({ ...placeholderDraft, fields: placeholderDraft.fields.filter((item) => item.id !== field.id) })}><Trash2 size={13} /></button></div>)}</div><div className="drawer-footer"><button className="outline-btn" onClick={() => { setPlaceholderDraft(null); setModuleDrawer(null); }}>Cancel</button><button className="primary-btn" onClick={savePlaceholderDraft}><Save size={14} /> Save group</button></div></aside></div>;
+    }
+    if (moduleDrawer === "layout" && layoutDraft) {
+      const draftLayout = layoutDraft.letterhead.firstPage || layoutDraft.letterhead;
+      return <div className="module-drawer-backdrop" onClick={() => setModuleDrawer(null)}><aside className="module-drawer" onClick={(event) => event.stopPropagation()}><div className="drawer-heading"><div><span className="eyebrow">LAYOUT EDITOR</span><h2>{layoutDraft.name}</h2><p>Save a reusable layout or apply a document-level snapshot from Workspace.</p></div><button className="icon-btn" onClick={() => setModuleDrawer(null)}><X size={17} /></button></div><label className="drawer-field"><span>Layout name</span><input value={layoutDraft.name} onChange={(e) => setLayoutDraft({ ...layoutDraft, name: e.target.value })} /></label><div className="drawer-grid"><label className="drawer-field"><span>Accent color</span><input type="color" value={draftLayout.accent} onChange={(e) => setLayoutDraft({ ...layoutDraft, letterhead: normalizeLetterhead({ ...layoutDraft.letterhead, accent: e.target.value }) })} /></label><label className="drawer-field"><span>Page</span><select value={layoutDraft.letterhead.page} onChange={(e) => setLayoutDraft({ ...layoutDraft, letterhead: { ...layoutDraft.letterhead, page: e.target.value as Letterhead["page"] } })}><option value="A4">A4</option><option value="Letter">Letter</option></select></label></div><div className="layout-editor-preview"><div className="layout-thumb" style={{ borderTopColor: draftLayout.accent }}><div className="layout-thumb-brand"><span style={{ background: draftLayout.accent }}>N</span><strong>{values.company_name || "Northstar Labs"}</strong></div><div className="layout-thumb-lines" /></div></div><div className="drawer-grid"><label className="drawer-field"><span>Top offset</span><input type="number" value={draftLayout.top} onChange={(e) => setLayoutDraft({ ...layoutDraft, letterhead: normalizeLetterhead({ ...layoutDraft.letterhead, top: Number(e.target.value) }) })} /></label><label className="drawer-field"><span>Body margin</span><input type="number" value={draftLayout.margin} onChange={(e) => setLayoutDraft({ ...layoutDraft, letterhead: normalizeLetterhead({ ...layoutDraft.letterhead, margin: Number(e.target.value) }) })} /></label></div><label className="drawer-field"><span>Page usage</span><div className="segmented-control"><button className={layoutDraft.letterhead.mode === "first" ? "active" : ""} onClick={() => setLayoutDraft({ ...layoutDraft, letterhead: { ...layoutDraft.letterhead, mode: "first" } })}>First page</button><button className={layoutDraft.letterhead.mode === "all" ? "active" : ""} onClick={() => setLayoutDraft({ ...layoutDraft, letterhead: { ...layoutDraft.letterhead, mode: "all" } })}>Every page</button><button className={layoutDraft.letterhead.mode === "different" ? "active" : ""} onClick={() => setLayoutDraft({ ...layoutDraft, letterhead: { ...layoutDraft.letterhead, mode: "different" } })}>Different pages</button></div></label><div className="drawer-footer"><button className="outline-btn" onClick={() => { setLayoutDraft(null); setModuleDrawer(null); }}>Cancel</button><button className="outline-btn" onClick={() => saveLayoutDraft(false)}><Save size={14} /> Save draft</button><button className="primary-btn" disabled={currentRole !== "Admin"} onClick={() => saveLayoutDraft(true)}><ShieldCheck size={14} /> Publish</button></div></aside></div>;
+    }
+    return null;
+  };
+  const primaryActionLabel =
+    docStatus === "Approved"
+      ? "Approved"
+      : blockingIssues.length
+      ? "Review issues"
+      : currentRole === "Reviewer" && docStatus === "In review"
+        ? "Approve version"
+        : docStatus === "In review"
+          ? "View submission"
+          : "Send for review";
 
   return (
     <div className="app-shell">
+      <input ref={letterheadInputRef} type="file" accept=".png,.jpg,.jpeg,.pdf,.docx" hidden onChange={(e) => uploadLetterhead(e.target.files?.[0])} />
+      <input ref={placeholderImportInputRef} type="file" accept=".csv,.xlsx,.xls" hidden onChange={(e) => previewPlaceholderImport(e.target.files?.[0])} />
+      <aside className={`global-sidebar ${sidebarCollapsed ? "collapsed" : ""}`} aria-label="Primary navigation">
+        <div className="global-sidebar-brand"><div className="brand-mark"><FileText size={16} /></div>{!sidebarCollapsed && <div><strong>HR Doc Generator</strong><small>Northstar workspace</small></div>}</div>
+        <div className="global-workspace-switch"><div className="company-dot">N</div>{!sidebarCollapsed && <div><strong>Northstar Labs</strong><span>Malaysia · MY</span></div>}<ChevronDown size={13} /></div>
+        <nav className="global-nav">
+          {navItems.map(([id, label, Icon]) => <button key={id} className={activeModule === id ? "active" : ""} onClick={() => switchModule(id as AppModule)} title={sidebarCollapsed ? label : undefined} aria-label={label} aria-current={activeModule === id ? "page" : undefined}><Icon size={17} /><span>{label}</span></button>)}
+        </nav>
+        <div className="global-sidebar-spacer" />
+        {!sidebarCollapsed && <div className="global-help"><span className="eyebrow">WORKSPACE</span><strong>Keep your document flow moving</strong><small>Build, review and export from one place.</small></div>}
+        <div className="global-nav global-nav-secondary"><button title="Account" aria-label="Account"><UserRound size={16} /><span>Account</span></button><button title="Members and roles" aria-label="Members and roles"><UsersRound size={16} /><span>Members & roles</span></button><button title="Subscription" aria-label="Subscription"><ShieldCheck size={16} /><span>Subscription</span></button><button title="Settings" aria-label="Settings"><Settings2 size={16} /><span>Settings</span></button><button title={theme === "light" ? "Switch to dark theme" : "Switch to light theme"} aria-label="Toggle theme" onClick={() => setTheme((current) => current === "light" ? "dark" : "light")}>{theme === "light" ? <Moon size={16} /> : <Sun size={16} />}<span>Theme</span></button></div>
+        <button className="sidebar-collapse" onClick={() => setSidebarCollapsed((current) => !current)} aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>{sidebarCollapsed ? <PanelLeftOpen size={16} /> : <><PanelLeftClose size={16} /><span>Collapse</span></>}</button>
+      </aside>
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">
@@ -2220,16 +2877,16 @@ function App() {
           )}
           </div>
           <span className="crumb">/</span>
-          <button
+          {activeModule === "workspace" ? <button
             className="doc-title"
             onClick={() => renameDocument()}
           >
             {docName}
             <ChevronDown size={14} />
-          </button>
+          </button> : <span className="module-top-title">{moduleTitle}</span>}
         </div>
         <div className="top-actions">
-          <div className={`save-state ${saving}`}>
+          {activeModule === "workspace" && <><div className={`save-state ${saving}`}>
             {saving === "error" ? <AlertTriangle size={14} /> : <Cloud size={14} />}
             {saving === "saving"
               ? "Saving…"
@@ -2245,7 +2902,7 @@ function App() {
             onClick={() => setShowHistory(true)}
           >
             <History size={17} />
-          </button>
+          </button></>}
           <button
             className="icon-btn theme-toggle"
             title={theme === "light" ? "Switch to dark theme" : "Switch to light theme"}
@@ -2254,11 +2911,11 @@ function App() {
           >
             {theme === "light" ? <Moon size={16} /> : <Sun size={16} />}
           </button>
-          <button className="outline-btn" onClick={() => setShowPreview(true)}>
+          {activeModule === "workspace" && <button className="outline-btn" onClick={() => setShowPreview(true)}>
             <FileCheck2 size={15} />
             Preview
-          </button>
-          <button
+          </button>}
+          {activeModule === "workspace" && <button
             className="primary-btn"
             disabled={reviewActionDisabled}
             title={
@@ -2275,12 +2932,20 @@ function App() {
                 setShowPreview(true);
                 return;
               }
+              if (docStatus === "Approved") return;
+              if (docStatus === "In review" && currentRole !== "Reviewer") {
+                setWorkflowStage("review");
+                setShowPreview(true);
+                return;
+              }
               if (currentRole === "Reviewer" && docStatus === "In review") {
                 setDocStatus("Approved");
+                setWorkflowStage("export");
                 createVersion("Approved by reviewer", "Approved");
                 setToast("Document approved and version locked");
               } else {
                 setDocStatus("In review");
+                setWorkflowStage("review");
                 createVersion("Submitted for review", "In review");
                 setToast("Sent for review");
               }
@@ -2288,8 +2953,8 @@ function App() {
             }}
           >
             <ShieldCheck size={15} />
-            {currentRole === "Reviewer" && docStatus === "In review" ? "Approve" : "Send for review"}
-          </button>
+            {primaryActionLabel}
+          </button>}
           <div className="role-switch-wrap">
             <button
               className="avatar role-avatar"
@@ -2321,19 +2986,39 @@ function App() {
           </div>
         </div>
       </header>
-      <div className="subbar">
+      {activeModule === "workspace" && <div className="subbar">
         <div className="flow">
-          <span className="flow-step active">
-            1 <span>Build</span>
+          {(["build", "review", "export"] as WorkflowStage[]).map((stage, index) => {
+            const isComplete = index < workflowStageIndex || (stage === "export" && docStatus === "Approved");
+            const isCurrent = stage === effectiveWorkflowStage;
+            const label = stage === "build" ? "Build" : stage === "review" ? "Review" : "Export";
+            return (
+              <React.Fragment key={stage}>
+                <button
+                  className={`flow-step ${isCurrent ? "active" : ""} ${isComplete ? "complete" : ""}`}
+                  onClick={() => goToWorkflowStage(stage)}
+                  aria-current={isCurrent ? "step" : undefined}
+                >
+                  {isComplete ? <Check size={12} /> : <span className="flow-number">{index + 1}</span>}
+                  <span>{label}</span>
+                </button>
+                {index < 2 && <span className="flow-line" />}
+              </React.Fragment>
+            );
+          })}
+        </div>
+        <div className={`workflow-context ${workflowSummary.tone}`}>
+          <span className="workflow-context-icon">
+            {workflowSummary.tone === "warning" ? <AlertTriangle size={14} /> : workflowSummary.tone === "success" ? <Check size={14} /> : workflowSummary.tone === "review" ? <ShieldCheck size={14} /> : <Circle size={10} />}
           </span>
-          <span className="flow-line" />
-          <span className="flow-step">
-            2 <span>Review</span>
+          <span className="workflow-context-copy">
+            <strong>{workflowSummary.title}</strong>
+            <span>{workflowSummary.detail}</span>
           </span>
-          <span className="flow-line" />
-          <span className="flow-step">
-            3 <span>Export</span>
-          </span>
+          <button className="workflow-context-action" onClick={() => goToWorkflowStage(workflowSummary.targetStage)}>
+            {workflowSummary.action}
+            <ChevronRight size={13} />
+          </button>
         </div>
         <div className="sub-actions">
           <span
@@ -2345,26 +3030,36 @@ function App() {
             <Save size={14} />
             Save
           </button>
-          <button className="sub-btn" disabled={currentRole !== "Admin"} onClick={() => { setAdminView(null); setShowAdmin(true); }} title={currentRole !== "Admin" ? "Admin role required" : "Manage workspace"}>
+          <button className="sub-btn manage-btn" disabled={currentRole !== "Admin"} onClick={() => { setAdminView(null); setShowAdmin(true); }} title={currentRole !== "Admin" ? "Admin role required" : "Open template and workspace settings"}>
             <Settings2 size={14} />
-            Manage
+            Admin settings
           </button>
         </div>
-      </div>
-      <div className="workspace">
+      </div>}
+      {activeModule === "workspace" ? <div className={`workspace ${leftRailCollapsed ? "left-rail-collapsed" : ""}`}>
         <aside className="left-rail">
           <div className="rail-section">
             <div className="rail-heading">
-              <span>DOCUMENT</span>
-              <button
-                className="mini-icon"
-                title="Open document"
-                aria-haspopup="menu"
-                aria-expanded={documentMenuOpen}
-                onClick={() => setDocumentMenuOpen((open) => !open)}
-              >
-                <FolderOpen size={14} />
-              </button>
+              <span>DOCUMENT SETUP</span>
+              <div className="rail-heading-actions">
+                <button
+                  className="mini-icon"
+                  title="Open document"
+                  aria-haspopup="menu"
+                  aria-expanded={documentMenuOpen}
+                  onClick={() => setDocumentMenuOpen((open) => !open)}
+                >
+                  <FolderOpen size={14} />
+                </button>
+                <button
+                  className="mini-icon rail-collapse-btn"
+                  title={leftRailCollapsed ? "Expand section navigator" : "Collapse section navigator"}
+                  aria-label={leftRailCollapsed ? "Expand section navigator" : "Collapse section navigator"}
+                  onClick={() => setLeftRailCollapsed((collapsed) => !collapsed)}
+                >
+                  {leftRailCollapsed ? <PanelLeftOpen size={14} /> : <PanelLeftClose size={14} />}
+                </button>
+              </div>
             </div>
             {documentMenuOpen && (
               <div className="document-menu" role="menu">
@@ -2391,11 +3086,18 @@ function App() {
               </select>
               <ChevronDown size={14} />
             </div>
+            <div className="template-context">
+              <span className="template-context-dot" style={{ background: template.color }} />
+              <span>
+                <strong>{template.name}</strong>
+                <small>{template.description}</small>
+              </span>
+            </div>
           </div>
           <div className="rail-section">
             <div className="rail-heading">
               <span>
-                SECTIONS <em>{sections.length}</em>
+                CONTENT <em>{sections.length} sections</em>
               </span>
               <button
                 className="mini-icon"
@@ -2859,7 +3561,7 @@ function App() {
               onClick={() => setActiveRightTab("person")}
             >
               <UserRound size={15} />
-              Person
+              Source
             </button>
             <button
               className={activeRightTab === "placeholders" ? "active" : ""}
@@ -2888,7 +3590,7 @@ function App() {
               <div className="panel-title-row">
                 <div>
                   <span className="eyebrow">ONBOARDING</span>
-                  <h3>Person & submission</h3>
+                  <h3>Source & submission</h3>
                 </div>
                 <button className="mini-icon">
                   <MoreHorizontal size={15} />
@@ -3122,6 +3824,7 @@ function App() {
                 <Plus size={14} />
                 Create placeholder
               </button>
+              <button className="text-btn" onClick={() => switchModule("placeholders")}>Open Placeholder Management <ChevronRight size={13} /></button>
             </div>
           )}
           {activeRightTab === "clauses" && (
@@ -3131,13 +3834,9 @@ function App() {
                   <span className="eyebrow">LIBRARY</span>
                   <h3>Clause selection</h3>
                 </div>
-                <button
-                  className="mini-icon"
-                  onClick={() => addClause(activeSection)}
-                >
-                  <Plus size={15} />
-                </button>
+                <div className="row-actions"><button className="mini-icon" title="Add custom clause" onClick={() => addClause(activeSection)}><Plus size={15} /></button><button className="mini-icon" title="Open Clauses Library" onClick={() => switchModule("clauses")}><FolderOpen size={14} /></button></div>
               </div>
+              <button className="add-field" onClick={() => switchModule("clauses")}><Archive size={14} /> Add from Clauses Library</button>
               <div className="helper-callout amber">
                 <CircleHelp size={15} />
                 <span>
@@ -3334,12 +4033,17 @@ function App() {
                   <Save size={14} />
                   Publish template layout v{(templateVersions[templateId] || 0) + 1}
                 </button>
-                <button className="text-btn" onClick={() => setToast("Current document keeps this layout independently")}>Save only to current document</button>
+              <button className="text-btn" onClick={() => { setModuleNotice("Current document keeps this layout independently"); }}><Check size={13} /> Save only to current document</button>
+              <button className="text-btn" onClick={() => switchModule("layouts")}>Open Layout Management <ChevronRight size={13} /></button>
               </div>
             </div>
           )}
         </aside>
-      </div>
+      </div> : renderModulePage()}
+      {activeModule === "placeholders" && <button className="module-import-float" onClick={() => { openPlaceholderEditor(); window.setTimeout(() => placeholderImportInputRef.current?.click(), 0); }}><Upload size={14} /> Import CSV / Excel</button>}
+      {importPreview && activeModule === "placeholders" && <div className="import-preview-panel"><div><span className="eyebrow">SOURCE PREVIEW</span><h3>{importPreview.fileName}</h3><p>{importPreview.headers.length} fields detected · first three records shown</p></div><div className="import-preview-fields">{importPreview.headers.slice(0, 8).map((header) => <code key={header}>{header}</code>)}</div><div className="row-actions"><button className="outline-btn" onClick={() => setImportPreview(null)}>Cancel</button><button className="primary-btn" onClick={confirmPlaceholderImport}><Check size={14} /> Use detected fields</button></div></div>}
+      {renderModuleDrawer()}
+      {moduleNotice && <div className="module-notice" role="status"><CheckCircle2 size={15} />{moduleNotice}<button className="icon-btn" onClick={() => setModuleNotice("")}><X size={13} /></button></div>}
       {showPreview && (
         <div className="modal-backdrop" onClick={() => setShowPreview(false)}>
           <div className="preview-modal" onClick={(e) => e.stopPropagation()}>
