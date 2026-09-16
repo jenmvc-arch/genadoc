@@ -23,6 +23,7 @@ import {
   AlertTriangle,
   ArrowDown,
   ArrowUp,
+  Bell,
   Bold,
   CheckCircle2,
   ChevronDown,
@@ -32,6 +33,8 @@ import {
   Cloud,
   Copy,
   Download,
+  Eye,
+  EyeOff,
   FileCheck2,
   FileText,
   FolderOpen,
@@ -39,11 +42,15 @@ import {
   Highlighter,
   History,
   ImagePlus,
+  Inbox,
   Italic,
+  KeyRound,
   Link2,
   List,
   ListOrdered,
   Lock,
+  LogIn,
+  LogOut,
   Mail,
   MoreHorizontal,
   Paintbrush,
@@ -55,12 +62,16 @@ import {
   RotateCcw,
   Save,
   Search,
+  Send,
   Settings2,
   ShieldCheck,
   Sparkles,
   Strikethrough,
   Sun,
   Table2,
+  Type,
+  PenLine,
+  PanelBottom,
   Trash2,
   Underline,
   Undo2,
@@ -91,6 +102,19 @@ type Clause = {
   sourceClauseVersion?: number;
 };
 type Section = { id: string; title: string; clauses: Clause[] };
+type CanvasBlockKind =
+  | "letterhead"
+  | "meta"
+  | "title"
+  | "lede"
+  | "section"
+  | "signatures"
+  | "footer";
+type CanvasBlock = {
+  id: string;
+  kind: CanvasBlockKind;
+  sectionId?: string;
+};
 type Template = {
   id: string;
   name: string;
@@ -124,6 +148,13 @@ type Letterhead = {
   subsequentPage?: LetterheadLayout;
 };
 type LetterheadLayout = Pick<Letterhead, "accent" | "opacity" | "top" | "left" | "width" | "margin" | "fileName" | "fileType" | "dataUrl">;
+type VerificationWatermark = {
+  placement: "header" | "footer";
+  alignment: "left" | "center" | "right";
+  text: string;
+  timestampFormat: string;
+  verificationId: string;
+};
 type CustomPlaceholder = {
   key: string;
   label: string;
@@ -131,6 +162,11 @@ type CustomPlaceholder = {
   group: string;
 };
 type UserRole = "Admin" | "Editor" | "Reviewer";
+type AuthSession = {
+  displayName: string;
+  email: string;
+  signedInAt: string;
+};
 type SyncDiff = { key: string; oldValue: string; newValue: string };
 type DocumentVersion = {
   id: string;
@@ -142,6 +178,7 @@ type DocumentVersion = {
   sections: Section[];
   values: Record<string, string>;
   letterhead: Letterhead;
+  watermark?: VerificationWatermark;
   docName: string;
   templateId?: string;
   personId?: string;
@@ -151,6 +188,7 @@ type DocumentVersion = {
   manualOverrides?: string[];
   sourceUpdates?: Record<string, Record<string, string>>;
   sourceUpdateMeta?: Record<string, { submissionId: string; detectedAt: string }>;
+  canvasBlocks?: CanvasBlock[];
 };
 type PendingChange = {
   kind: "template" | "person";
@@ -166,7 +204,44 @@ type PromptRequest = {
 };
 
 type WorkflowStage = "build" | "review" | "export";
-type AppModule = "workspace" | "clauses" | "placeholders" | "layouts" | "documents";
+type AppModule = "workspace" | "clauses" | "placeholders" | "layouts" | "documents" | "settings";
+type EmailSettings = {
+  provider: "gmail";
+  authMethod: "oauth" | "app-password";
+  gmailAddress: string;
+  gmailAppPassword: string;
+  senderName: string;
+  replyToEmail: string;
+  documentInboxEmail: string;
+  notificationEmail: string;
+  sendDocuments: boolean;
+  receiveCopies: boolean;
+  notificationsEnabled: boolean;
+};
+type EmailSettingsErrors = Partial<Record<keyof EmailSettings, string>>;
+type EmailConnectionSummary = {
+  id: string;
+  provider: "gmail";
+  authMethod: "oauth" | "app-password";
+  senderEmail: string;
+  senderName: string;
+  replyToEmail: string;
+  documentInboxEmail: string;
+  notificationEmail: string;
+  sendDocuments: boolean;
+  receiveCopies: boolean;
+  notificationsEnabled: boolean;
+  status: "connected" | "expired" | "error" | "disconnected";
+  lastTestedAt?: string | null;
+  lastError?: string | null;
+  updatedAt?: string;
+};
+type EmailPlatformStatus = {
+  ready: boolean;
+  googleOAuthReady: boolean;
+  missing: string[];
+  code?: string;
+};
 type ClauseSubsection = { id: string; title: string; contents: Clause[]; collapsed?: boolean };
 type ClauseRecord = {
   id: string;
@@ -232,9 +307,11 @@ type DocumentRecord = {
   sections: Section[];
   values: Record<string, string>;
   letterhead: Letterhead;
+  watermark: VerificationWatermark;
   versions: DocumentVersion[];
   exports: ExportRecord[];
   updatedAt: string;
+  canvasBlocks?: CanvasBlock[];
 };
 type NavigationState = {
   module: AppModule;
@@ -598,7 +675,38 @@ const placeholderMeta = [
 ];
 
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value));
+const fixedCanvasBlock = (kind: Exclude<CanvasBlockKind, "section">): CanvasBlock => ({
+  id: `canvas-${kind}`,
+  kind,
+});
+const makeDefaultCanvasBlocks = (items: Section[]): CanvasBlock[] => [
+  fixedCanvasBlock("letterhead"),
+  fixedCanvasBlock("meta"),
+  fixedCanvasBlock("title"),
+  fixedCanvasBlock("lede"),
+  ...items.map((section) => ({
+    id: `canvas-section-${section.id}`,
+    kind: "section" as const,
+    sectionId: section.id,
+  })),
+  fixedCanvasBlock("signatures"),
+  fixedCanvasBlock("footer"),
+];
 const storageKey = "hr-doc-generator-state-v2";
+const authStorageKey = "hr-doc-generator-auth-v1";
+const defaultEmailSettings: EmailSettings = {
+  provider: "gmail",
+  authMethod: "oauth",
+  gmailAddress: "",
+  gmailAppPassword: "",
+  senderName: "",
+  replyToEmail: "",
+  documentInboxEmail: "",
+  notificationEmail: "",
+  sendDocuments: true,
+  receiveCopies: false,
+  notificationsEnabled: true,
+};
 const defaultLetterheadLayout: LetterheadLayout = {
   accent: "#3336cc",
   opacity: 0.12,
@@ -632,6 +740,49 @@ const normalizeLetterhead = (value?: Partial<Letterhead>): Letterhead => {
     },
   };
 };
+const makeVerificationId = () => {
+  const randomPart = typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID().replaceAll("-", "").slice(0, 12)
+    : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`.slice(0, 12);
+  return `DOC-${randomPart.toUpperCase()}`;
+};
+const makeDefaultWatermark = (): VerificationWatermark => ({
+  placement: "footer",
+  alignment: "center",
+  text: "VERIFIED DOCUMENT",
+  timestampFormat: "YYYY-MM-DD HH:mm:ss Z",
+  verificationId: makeVerificationId(),
+});
+const normalizeWatermark = (value?: Partial<VerificationWatermark>): VerificationWatermark => ({
+  placement: value?.placement === "header" ? "header" : "footer",
+  alignment: value?.alignment === "left" || value?.alignment === "right" ? value.alignment : "center",
+  text: value?.text ?? "VERIFIED DOCUMENT",
+  timestampFormat: value?.timestampFormat ?? "YYYY-MM-DD HH:mm:ss Z",
+  verificationId: value?.verificationId || makeVerificationId(),
+});
+const formatWatermarkTimestamp = (date: Date, pattern: string) => {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const hours = date.getHours();
+  const offsetMinutes = -date.getTimezoneOffset();
+  const offsetSign = offsetMinutes >= 0 ? "+" : "-";
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const tokens: Record<string, string> = {
+    YYYY: String(date.getFullYear()),
+    YY: String(date.getFullYear()).slice(-2),
+    MMM: date.toLocaleDateString("en-US", { month: "short" }),
+    MM: pad(date.getMonth() + 1),
+    DD: pad(date.getDate()),
+    HH: pad(hours),
+    hh: pad(hours % 12 || 12),
+    mm: pad(date.getMinutes()),
+    ss: pad(date.getSeconds()),
+    A: hours >= 12 ? "PM" : "AM",
+    Z: `${offsetSign}${pad(Math.floor(absoluteOffset / 60))}:${pad(absoluteOffset % 60)}`,
+  };
+  return (pattern.trim() || "YYYY-MM-DD HH:mm:ss Z").replace(/YYYY|MMM|YY|MM|DD|HH|hh|mm|ss|A|Z/g, (token) => tokens[token]);
+};
+const watermarkDisplayText = (settings: VerificationWatermark, date = new Date()) =>
+  `${settings.text.trim() || "VERIFIED DOCUMENT"} · ${settings.verificationId} · ${formatWatermarkTimestamp(date, settings.timestampFormat)}`;
 const formatFileDate = (date = new Date()) => {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -656,9 +807,17 @@ const blobToDataUrl = (blob: Blob) => new Promise<string>((resolve, reject) => {
 const appStoreKey = "hr-doc-generator-app-store-v1";
 const navigationKey = "hr-doc-generator-navigation-v1";
 const companyId = "northstar-labs-my";
+const readAuthSession = (): AuthSession | null => {
+  try {
+    const raw = sessionStorage.getItem(authStorageKey) || localStorage.getItem(authStorageKey);
+    return raw ? JSON.parse(raw) as AuthSession : null;
+  } catch {
+    return null;
+  }
+};
 const moduleFromHash = (hash: string): AppModule => {
   const value = hash.replace(/^#/, "");
-  return (["workspace", "clauses", "placeholders", "layouts", "documents"] as AppModule[]).includes(value as AppModule)
+  return (["workspace", "clauses", "placeholders", "layouts", "documents", "settings"] as AppModule[]).includes(value as AppModule)
     ? (value as AppModule)
     : "workspace";
 };
@@ -719,7 +878,14 @@ const readAppStore = (): AppStore => {
         clauses: parsed.clauses || [],
         placeholderGroups: parsed.placeholderGroups || makeDefaultPlaceholderGroups(),
         layouts: parsed.layouts || [],
-        documents: parsed.documents || [],
+        documents: (parsed.documents || []).map((document) => ({
+          ...document,
+          watermark: normalizeWatermark(document.watermark),
+          versions: (document.versions || []).map((version) => ({
+            ...version,
+            watermark: normalizeWatermark(version.watermark || document.watermark),
+          })),
+        })),
         exports: parsed.exports || [],
       };
     }
@@ -729,6 +895,7 @@ const readAppStore = (): AppStore => {
     const legacySections: Section[] = legacy.sections || clone(demoTemplates[1].sections);
     const legacyValues = legacy.values || clone(people[1].fields);
     const legacyLetterhead = normalizeLetterhead(legacy.letterhead);
+    const legacyWatermark = normalizeWatermark(legacy.watermark);
     const clauses = legacyTemplates.flatMap((template) => template.sections.flatMap((section) => section.clauses.map((clause) => makeClauseRecord(clause, template, section.title))));
     const layouts: LayoutRecord[] = [{
       id: "layout-default",
@@ -749,9 +916,14 @@ const readAppStore = (): AppStore => {
       sections: legacySections,
       values: legacyValues,
       letterhead: legacyLetterhead,
-      versions: legacy.versions || [],
+      watermark: legacyWatermark,
+      versions: (legacy.versions || []).map((version: DocumentVersion) => ({
+        ...version,
+        watermark: normalizeWatermark(version.watermark || legacyWatermark),
+      })),
       exports: [],
       updatedAt: legacy.lastSavedAt || formatDocumentStamp(),
+      canvasBlocks: legacy.canvasBlocks || makeDefaultCanvasBlocks(legacySections),
     };
     if (legacyRaw) {
       localStorage.setItem(`${storageKey}-backup-${Date.now()}`, legacyRaw);
@@ -780,7 +952,203 @@ const readAppStore = (): AppStore => {
   }
 };
 
+function LoginScreen({
+  theme,
+  onThemeChange,
+  onLogin,
+}: {
+  theme: "light" | "dark";
+  onThemeChange: () => void;
+  onLogin: (session: AuthSession, remember: boolean) => void;
+}) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [remember, setRemember] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+
+  const submitLogin = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (submitting) return;
+    setSubmitting(true);
+    const normalizedEmail = email.trim();
+    const label = normalizedEmail
+      ? normalizedEmail.split("@")[0].replace(/[._-]+/g, " ").trim()
+      : "Demo HR user";
+    window.setTimeout(() => {
+      setSubmitting(false);
+      onLogin({
+        displayName: label || "Demo HR user",
+        email: normalizedEmail,
+        signedInAt: new Date().toISOString(),
+      }, remember);
+    }, 320);
+  };
+
+  return (
+    <main className="login-screen">
+      <section className="login-context" aria-label="ZhiReady workspace information">
+        <div className="login-brand">
+          <img
+            src={theme === "light" ? "/brand/zhiready-light.png" : "/brand/zhiready-dark.png"}
+            alt="ZhiReady"
+          />
+          <small>Document operations workspace</small>
+        </div>
+
+        <div className="login-context-copy">
+          <span className="login-kicker">Controlled document workflow</span>
+          <h1>HR documents, ready for review.</h1>
+          <p>Create, verify and export employment documents in one focused workspace.</p>
+
+          <div className="login-workspace-summary">
+            <div className="login-workspace-heading">
+              <span className="login-workspace-mark">N</span>
+              <span><strong>Northstar Labs</strong><small>Malaysia workspace</small></span>
+              <CheckCircle2 size={17} aria-label="Workspace available" />
+            </div>
+            <div className="login-capability-list">
+              <span><FileText size={15} /><span><strong>Document workspace</strong><small>Build, review and export</small></span></span>
+              <span><Cloud size={15} /><span><strong>Onboarding sources</strong><small>Mapped data and overrides</small></span></span>
+              <span><ShieldCheck size={15} /><span><strong>Approval controls</strong><small>Versions and document status</small></span></span>
+            </div>
+          </div>
+        </div>
+
+        <p className="login-context-note">Demo environment. No employee notification is sent from this screen.</p>
+      </section>
+
+      <section className="login-form-region">
+        <button
+          className="login-theme-toggle"
+          type="button"
+          onClick={onThemeChange}
+          aria-label={theme === "light" ? "Switch to dark theme" : "Switch to light theme"}
+          title={theme === "light" ? "Switch to dark theme" : "Switch to light theme"}
+        >
+          {theme === "light" ? <Moon size={17} /> : <Sun size={17} />}
+        </button>
+
+        <form className="login-form" onSubmit={submitLogin}>
+          <div className="login-form-heading">
+            <span>Welcome back</span>
+            <h2>Sign in to your workspace</h2>
+            <p>Use your work account, or continue with the blank demo access.</p>
+          </div>
+
+          <label className="login-field">
+            <span>Work email <small>Optional</small></span>
+            <input
+              type="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              autoComplete="username"
+              placeholder="name@company.com"
+              autoFocus
+            />
+          </label>
+
+          <label className="login-field">
+            <span>Password <small>Optional</small></span>
+            <span className="login-password-field">
+              <input
+                type={showPassword ? "text" : "password"}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                autoComplete="current-password"
+                placeholder="Enter your password"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((current) => !current)}
+                aria-label={showPassword ? "Hide password" : "Show password"}
+                title={showPassword ? "Hide password" : "Show password"}
+              >
+                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </span>
+          </label>
+
+          <label className="login-remember">
+            <input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />
+            <span>Keep me signed in on this device</span>
+          </label>
+
+          <button className="login-submit" type="submit" disabled={submitting}>
+            <LogIn size={17} />
+            {submitting ? "Signing in..." : "Sign in"}
+          </button>
+
+          <div className="login-demo-note" aria-live="polite">
+            <ShieldCheck size={17} />
+            <span><strong>Blank access is enabled</strong><small>Leave both fields empty and select Sign in. Passwords are not stored in this browser demo.</small></span>
+          </div>
+        </form>
+      </section>
+    </main>
+  );
+}
+
 function App() {
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    const savedTheme = localStorage.getItem("hr-doc-generator-theme");
+    return savedTheme === "dark" ? "dark" : "light";
+  });
+  const [authSession, setAuthSession] = useState<AuthSession | null>(() => readAuthSession());
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("hr-doc-generator-theme", theme);
+  }, [theme]);
+
+  const handleLogin = (session: AuthSession, remember: boolean) => {
+    try {
+      localStorage.removeItem(authStorageKey);
+      sessionStorage.removeItem(authStorageKey);
+      const storage = remember ? localStorage : sessionStorage;
+      storage.setItem(authStorageKey, JSON.stringify(session));
+    } finally {
+      setAuthSession(session);
+    }
+  };
+
+  const handleSignOut = () => {
+    localStorage.removeItem(authStorageKey);
+    sessionStorage.removeItem(authStorageKey);
+    setAuthSession(null);
+  };
+
+  if (!authSession) {
+    return (
+      <LoginScreen
+        theme={theme}
+        onThemeChange={() => setTheme((current) => current === "light" ? "dark" : "light")}
+        onLogin={handleLogin}
+      />
+    );
+  }
+
+  return (
+    <WorkspaceApp
+      authSession={authSession}
+      theme={theme}
+      setTheme={setTheme}
+      onSignOut={handleSignOut}
+    />
+  );
+}
+
+function WorkspaceApp({
+  authSession,
+  theme,
+  setTheme,
+  onSignOut,
+}: {
+  authSession: AuthSession;
+  theme: "light" | "dark";
+  setTheme: React.Dispatch<React.SetStateAction<"light" | "dark">>;
+  onSignOut: () => void;
+}) {
   const [appStore, setAppStore] = useState<AppStore>(() => readAppStore());
   const [activeModule, setActiveModule] = useState<AppModule>(() => moduleFromHash(window.location.hash));
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
@@ -801,6 +1169,14 @@ function App() {
   const [placeholderDraft, setPlaceholderDraft] = useState<PlaceholderGroup | null>(null);
   const [layoutDraft, setLayoutDraft] = useState<LayoutRecord | null>(null);
   const [importPreview, setImportPreview] = useState<{ fileName: string; headers: string[]; sample: Record<string, string>[] } | null>(null);
+  const [emailSettings, setEmailSettings] = useState<EmailSettings>(() => clone(defaultEmailSettings));
+  const [emailSettingsStatus, setEmailSettingsStatus] = useState<"idle" | "loading" | "saving" | "saved" | "error">("idle");
+  const [emailSettingsError, setEmailSettingsError] = useState("");
+  const [emailSettingsErrors, setEmailSettingsErrors] = useState<EmailSettingsErrors>({});
+  const [emailConnection, setEmailConnection] = useState<EmailConnectionSummary | null>(null);
+  const [emailPlatform, setEmailPlatform] = useState<EmailPlatformStatus>({ ready: false, googleOAuthReady: false, missing: [] });
+  const [emailAdvancedOpen, setEmailAdvancedOpen] = useState(false);
+  const [showGmailAppPassword, setShowGmailAppPassword] = useState(false);
   const [templates, setTemplates] = useState<Template[]>(() => {
     const saved = localStorage.getItem(storageKey);
     return saved ? JSON.parse(saved).templates : demoTemplates;
@@ -810,20 +1186,50 @@ function App() {
   const [sections, setSections] = useState<Section[]>(() =>
     clone(demoTemplates[1].sections),
   );
+  const [canvasBlocks, setCanvasBlocks] = useState<CanvasBlock[]>(() =>
+    makeDefaultCanvasBlocks(demoTemplates[1].sections),
+  );
+  const [canvasDrag, setCanvasDrag] = useState<
+    | { type: "block"; id: string }
+    | { type: "clause"; id: string; sectionId: string }
+    | null
+  >(null);
+  const [activeCanvasBlock, setActiveCanvasBlock] = useState("canvas-title");
+  const [addBlockMenuOpen, setAddBlockMenuOpen] = useState(false);
+  const [deletedCanvasSnapshot, setDeletedCanvasSnapshot] = useState<{
+    sections: Section[];
+    blocks: CanvasBlock[];
+    label: string;
+  } | null>(null);
   const [values, setValues] = useState<Record<string, string>>(() =>
     clone(people[1].fields),
   );
   const [letterhead, setLetterhead] = useState<Letterhead>({
     ...makeDefaultLetterhead(),
   });
+  const [watermark, setWatermark] = useState<VerificationWatermark>(() => {
+    try {
+      const saved = localStorage.getItem(storageKey);
+      return normalizeWatermark(saved ? JSON.parse(saved).watermark : undefined);
+    } catch {
+      return makeDefaultWatermark();
+    }
+  });
   const [letterheadEditorPage, setLetterheadEditorPage] = useState<"first" | "subsequent">("first");
   const [workflowStage, setWorkflowStage] = useState<WorkflowStage>("build");
-  const [leftRailCollapsed, setLeftRailCollapsed] = useState(false);
+  const [workspacePanelOpen, setWorkspacePanelOpen] = useState(false);
   const [activeSection, setActiveSection] = useState("parties");
   const [activeClause, setActiveClause] = useState("fixed-1");
   const [activeRightTab, setActiveRightTab] = useState<
-    "person" | "placeholders" | "clauses" | "letterhead"
-  >("person");
+    "outline" | "person" | "placeholders" | "clauses" | "letterhead" | "review"
+  >("outline");
+  const [workspaceLibraryOpen, setWorkspaceLibraryOpen] = useState<
+    "clauses" | "placeholders" | "layouts" | null
+  >(null);
+  const [workspaceLibrarySearch, setWorkspaceLibrarySearch] = useState("");
+  const [workspaceClausePreviewId, setWorkspaceClausePreviewId] = useState<string | null>(null);
+  const [workspaceToolMenuOpen, setWorkspaceToolMenuOpen] = useState(false);
+  const [clauseScope, setClauseScope] = useState<"all" | "current">("all");
   const [search, setSearch] = useState("");
   const [saving, setSaving] = useState<"saved" | "saving" | "error">("saved");
   const [lastSavedAt, setLastSavedAt] = useState("");
@@ -833,6 +1239,7 @@ function App() {
   const [showAdmin, setShowAdmin] = useState(false);
   const [adminView, setAdminView] = useState<string | null>(null);
   const [companyMenuOpen, setCompanyMenuOpen] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [documentMenuOpen, setDocumentMenuOpen] = useState(false);
   const [pendingChange, setPendingChange] = useState<PendingChange | null>(
     null,
@@ -847,10 +1254,6 @@ function App() {
   const [docName, setDocName] = useState("Marcus Lee · Fixed-Term Agreement");
   const [currentRole, setCurrentRole] = useState<UserRole>("Admin");
   const [roleMenuOpen, setRoleMenuOpen] = useState(false);
-  const [theme, setTheme] = useState<"light" | "dark">(() => {
-    const savedTheme = localStorage.getItem("hr-doc-generator-theme");
-    return savedTheme === "dark" ? "dark" : "light";
-  });
   const [connectionStatus, setConnectionStatus] = useState<"Connected" | "Syncing" | "Failed">("Connected");
   const [connectionError, setConnectionError] = useState("");
   const [lastSyncAt, setLastSyncAt] = useState("");
@@ -895,16 +1298,64 @@ function App() {
   } | null>(null);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    localStorage.setItem("hr-doc-generator-theme", theme);
-  }, [theme]);
-
-  useEffect(() => {
     const onHashChange = () => setActiveModule(moduleFromHash(window.location.hash));
     window.addEventListener("hashchange", onHashChange);
     if (!window.location.hash) window.history.replaceState(null, "", "#workspace");
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
+
+  useEffect(() => {
+    if (activeModule !== "settings") return;
+    let cancelled = false;
+    setEmailSettingsStatus("loading");
+    setEmailSettingsError("");
+    fetch("/api/email-connections/status", { headers: { Accept: "application/json" } })
+      .then(async (response) => {
+        const data = await response.json().catch(() => ({
+          ok: false,
+          code: "BACKEND_NOT_CONFIGURED",
+          error: "The cloud email service is not available from this development server.",
+          platform: { ready: false, googleOAuthReady: false, missing: ["DATABASE_URL", "AUTH_SESSION_SECRET", "EMAIL_CREDENTIAL_ENCRYPTION_KEY"] },
+        })) as {
+          ok?: boolean;
+          code?: string;
+          error?: string;
+          platform?: EmailPlatformStatus;
+          connection?: EmailConnectionSummary | null;
+        };
+        return { response, data };
+      })
+      .then(({ response, data }) => {
+        if (cancelled) return;
+        setEmailPlatform(data.platform || { ready: false, googleOAuthReady: false, missing: [], code: data.code });
+        setEmailConnection(data.connection || null);
+        if (data.connection) {
+          setEmailSettings({
+            ...clone(defaultEmailSettings),
+            authMethod: data.connection.authMethod,
+            gmailAddress: data.connection.senderEmail,
+            senderName: data.connection.senderName,
+            replyToEmail: data.connection.replyToEmail,
+            documentInboxEmail: data.connection.documentInboxEmail,
+            notificationEmail: data.connection.notificationEmail,
+            sendDocuments: data.connection.sendDocuments,
+            receiveCopies: data.connection.receiveCopies,
+            notificationsEnabled: data.connection.notificationsEnabled,
+          });
+        }
+        setEmailSettingsStatus("idle");
+        if (!response.ok) setEmailSettingsError(data.error || "The cloud email service is not configured.");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setEmailPlatform({ ready: false, googleOAuthReady: false, missing: ["DATABASE_URL", "AUTH_SESSION_SECRET", "EMAIL_CREDENTIAL_ENCRYPTION_KEY"] });
+        setEmailSettingsStatus("idle");
+        setEmailSettingsError("The cloud email service is not available from this development server.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeModule]);
 
   useEffect(() => {
     if (!moduleDrawer) return;
@@ -999,6 +1450,10 @@ function App() {
       }
       return { ...current, ...patch, [key]: nextLayout };
     }));
+  const updateWatermark = (patch: Partial<VerificationWatermark>) => {
+    if (!guardEdit()) return;
+    setWatermark((current) => ({ ...current, ...patch }));
+  };
   const syncDiffs = useMemo<SyncDiff[]>(() => {
     const incoming = sourceUpdates[personId] || {};
     return Object.keys(incoming)
@@ -1052,6 +1507,27 @@ function App() {
       return values.probation_period !== "Not applicable";
     return true;
   };
+  const hasCanvasBlock = (kind: CanvasBlockKind) =>
+    canvasBlocks.some((block) => block.kind === kind);
+  const orderedSections = canvasBlocks
+    .filter((block) => block.kind === "section" && block.sectionId)
+    .map((block) => sections.find((section) => section.id === block.sectionId))
+    .filter((section): section is Section => Boolean(section));
+  const clausePanelSections = clauseScope === "current"
+    ? orderedSections.filter((section) => section.id === activeSection)
+    : orderedSections;
+  const focusSection = (sectionId: string, openClauses = true) => {
+    const section = sections.find((item) => item.id === sectionId);
+    if (!section) return;
+    setActiveSection(section.id);
+    setActiveClause(section.clauses[0]?.id || "");
+    const block = canvasBlocks.find((item) => item.kind === "section" && item.sectionId === section.id);
+    if (block) setActiveCanvasBlock(block.id);
+    if (openClauses) setActiveRightTab("clauses");
+    window.requestAnimationFrame(() => {
+      document.querySelector(`[data-section-id="${section.id}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  };
 
   useEffect(() => {
     const saved = localStorage.getItem(storageKey);
@@ -1062,7 +1538,12 @@ function App() {
         setPersonId(state.personId || "EMP-2041");
         setValues(state.values || people[1].fields);
         setLetterhead(normalizeLetterhead(state.letterhead));
-        setSections(state.sections || clone(demoTemplates[1].sections));
+        setWatermark(normalizeWatermark(state.watermark));
+        const restoredSections = state.sections || clone(demoTemplates[1].sections);
+        setSections(restoredSections);
+        setCanvasBlocks(state.canvasBlocks || makeDefaultCanvasBlocks(restoredSections));
+        setActiveSection(restoredSections[0]?.id || "");
+        setActiveClause(restoredSections[0]?.clauses[0]?.id || "");
         setDocName(state.docName || "Marcus Lee · Fixed-Term Agreement");
         setDocStatus(state.docStatus || "Draft");
         setWorkflowStage(state.workflowStage || "build");
@@ -1102,7 +1583,9 @@ function App() {
               personId,
               values,
               letterhead,
+              watermark,
               sections,
+              canvasBlocks,
               docName,
               docStatus,
               workflowStage,
@@ -1137,7 +1620,9 @@ function App() {
     personId,
     values,
     letterhead,
+    watermark,
     sections,
+    canvasBlocks,
     docName,
     docStatus,
     workflowStage,
@@ -1154,6 +1639,39 @@ function App() {
     templateVersions,
     versionCounter,
   ]);
+
+  useEffect(() => {
+    setCanvasBlocks((current) => {
+      const sectionIds = new Set(sections.map((section) => section.id));
+      const retained = current.filter(
+        (block) =>
+          block.kind !== "section" ||
+          Boolean(block.sectionId && sectionIds.has(block.sectionId)),
+      );
+      const placed = new Set(
+        retained
+          .filter((block) => block.kind === "section")
+          .map((block) => block.sectionId),
+      );
+      const missing = sections
+        .filter((section) => !placed.has(section.id))
+        .map((section) => ({
+          id: `canvas-section-${section.id}`,
+          kind: "section" as const,
+          sectionId: section.id,
+        }));
+      if (!missing.length && retained.length === current.length) return current;
+      const footerIndex = retained.findIndex(
+        (block) => block.kind === "signatures" || block.kind === "footer",
+      );
+      if (footerIndex < 0) return [...retained, ...missing];
+      return [
+        ...retained.slice(0, footerIndex),
+        ...missing,
+        ...retained.slice(footerIndex),
+      ];
+    });
+  }, [sections]);
 
   const resolve = (text: string) =>
     text.replace(
@@ -1628,7 +2146,9 @@ function App() {
     const next = templates.find((item) => item.id === id);
     if (!next) return;
     setTemplateId(id);
-    setSections(clone(next.sections));
+    const nextSections = clone(next.sections);
+    setSections(nextSections);
+    setCanvasBlocks(makeDefaultCanvasBlocks(nextSections));
     setActiveSection(next.sections[0].id);
     setActiveClause(next.sections[0].clauses[0]?.id || "");
     setDocName(`${person.name} · ${next.type}`);
@@ -1849,27 +2369,45 @@ function App() {
       ),
     );
     setActiveClause(id);
+    setAddBlockMenuOpen(false);
   };
   const addSection = () => {
     if (!guardEdit()) return;
     const id = `section-${Date.now()}`;
-    setSections((prev) => [
-      ...prev,
-      {
-        id,
-        title: "New section",
-        clauses: [
-          {
-            id: `${id}-clause`,
-            title: "New paragraph",
-            tag: "Custom",
-            included: true,
-            text: "Start writing your paragraph here.",
-          },
-        ],
-      },
-    ]);
+    const section: Section = {
+      id,
+      title: "New section",
+      clauses: [
+        {
+          id: `${id}-clause`,
+          title: "New paragraph",
+          tag: "Custom",
+          included: true,
+          text: "Start writing your paragraph here.",
+        },
+      ],
+    };
+    setSections((prev) => [...prev, section]);
+    const block: CanvasBlock = {
+      id: `canvas-section-${id}`,
+      kind: "section",
+      sectionId: id,
+    };
+    setCanvasBlocks((current) => {
+      const footerIndex = current.findIndex(
+        (item) => item.kind === "signatures" || item.kind === "footer",
+      );
+      if (footerIndex < 0) return [...current, block];
+      return [
+        ...current.slice(0, footerIndex),
+        block,
+        ...current.slice(footerIndex),
+      ];
+    });
     setActiveSection(id);
+    setActiveClause(`${id}-clause`);
+    setActiveCanvasBlock(block.id);
+    setAddBlockMenuOpen(false);
   };
   const extractPlaceholderKeys = (text: string) =>
     [...text.matchAll(/{{(.*?)}}/g)].map((match) => match[1].trim());
@@ -1912,11 +2450,17 @@ function App() {
       issues.push("Milestone billing still contains an hourly amount");
     }
     const firstLayout = letterhead.firstPage || letterhead;
-    if (firstLayout.margin <= firstLayout.top + 8) {
+    if (hasCanvasBlock("letterhead") && firstLayout.margin <= firstLayout.top + 8) {
       issues.push("Letterhead overlaps the document body");
     }
+    if (!watermark.text.trim()) {
+      issues.push("Verification watermark text is required");
+    }
+    if (!watermark.timestampFormat.trim()) {
+      issues.push("Verification timestamp format is required");
+    }
     return issues;
-  }, [letterhead, person.id, person.name, person.role, personId, sections, templateId, values]);
+  }, [canvasBlocks, letterhead, person.id, person.name, person.role, personId, sections, templateId, values, watermark]);
   const blockingIssues = documentIssues;
   const workflowSummary = useMemo(() => {
     if (docStatus === "Approved") {
@@ -1975,7 +2519,7 @@ function App() {
       title: "Ready for review",
       detail: "Source data, clauses and layout checks are complete.",
       tone: "ready" as const,
-      action: "Open preview",
+      action: "Run review",
     };
   }, [blockingIssues.length, currentRole, docStatus, workflowStage]);
   const effectiveWorkflowStage: WorkflowStage = docStatus === "Approved"
@@ -1987,48 +2531,210 @@ function App() {
   const goToWorkflowStage = (stage: WorkflowStage) => {
     setWorkflowStage(stage);
     if (stage === "build") {
-      setActiveRightTab("person");
+      setActiveRightTab("outline");
+      setWorkspacePanelOpen(false);
+      setShowPreview(false);
+      return;
+    }
+    if (stage === "review") {
+      setActiveRightTab("review");
+      setWorkspacePanelOpen(true);
       setShowPreview(false);
       return;
     }
     setShowPreview(true);
   };
+  const rememberCanvasBeforeDelete = (label: string) => {
+    setDeletedCanvasSnapshot({
+      sections: clone(sections),
+      blocks: clone(canvasBlocks),
+      label,
+    });
+  };
+  const restoreDeletedCanvasItem = () => {
+    if (!deletedCanvasSnapshot) return;
+    setSections(clone(deletedCanvasSnapshot.sections));
+    setCanvasBlocks(clone(deletedCanvasSnapshot.blocks));
+    setDeletedCanvasSnapshot(null);
+    setToast(`${deletedCanvasSnapshot.label} restored`);
+    window.setTimeout(() => setToast(""), 2200);
+  };
+  const removeCanvasBlock = (block: CanvasBlock) => {
+    if (!guardEdit()) return;
+    const section = block.sectionId
+      ? sections.find((item) => item.id === block.sectionId)
+      : null;
+    const label = section?.title || block.kind.replaceAll("-", " ");
+    rememberCanvasBeforeDelete(label);
+    if (block.kind === "section" && block.sectionId) {
+      setSections((current) =>
+        current.filter((item) => item.id !== block.sectionId),
+      );
+      setActiveSection("");
+      setActiveClause("");
+    }
+    setCanvasBlocks((current) => current.filter((item) => item.id !== block.id));
+    setActiveCanvasBlock("");
+    setToast(`Removed ${label} from this document`);
+    window.setTimeout(() => setToast(""), 4200);
+  };
+  const clearCanvas = () => {
+    if (!guardEdit() || (!canvasBlocks.length && !sections.length)) return;
+    rememberCanvasBeforeDelete("Canvas content");
+    setSections([]);
+    setCanvasBlocks([]);
+    setActiveSection("");
+    setActiveClause("");
+    setActiveCanvasBlock("");
+    setAddBlockMenuOpen(false);
+    setToast("Canvas cleared");
+    window.setTimeout(() => setToast(""), 4200);
+  };
+  const addFixedCanvasBlock = (kind: Exclude<CanvasBlockKind, "section">) => {
+    if (!guardEdit()) return;
+    const existing = canvasBlocks.find((block) => block.kind === kind);
+    if (existing) {
+      setActiveCanvasBlock(existing.id);
+      setToast(`${kind.replaceAll("-", " ")} is already on the page`);
+      window.setTimeout(() => setToast(""), 1800);
+      return;
+    }
+    const next = fixedCanvasBlock(kind);
+    setCanvasBlocks((current) => [...current, next]);
+    setActiveCanvasBlock(next.id);
+    setAddBlockMenuOpen(false);
+  };
+  const addParagraphElement = () => {
+    if (!guardEdit()) return;
+    const targetSection = activeSection && sections.some((section) => section.id === activeSection)
+      ? activeSection
+      : sections[0]?.id;
+    if (targetSection) {
+      addClause(targetSection, true);
+      const block = canvasBlocks.find((item) => item.kind === "section" && item.sectionId === targetSection);
+      if (block) setActiveCanvasBlock(block.id);
+      setAddBlockMenuOpen(false);
+      return;
+    }
+    addSection();
+    setAddBlockMenuOpen(false);
+  };
+  const moveCanvasBlock = (sourceId: string, targetId: string) => {
+    if (!guardEdit() || sourceId === targetId) return;
+    setCanvasBlocks((current) => {
+      const sourceIndex = current.findIndex((block) => block.id === sourceId);
+      const targetIndex = current.findIndex((block) => block.id === targetId);
+      if (sourceIndex < 0 || targetIndex < 0) return current;
+      const next = [...current];
+      const [moved] = next.splice(sourceIndex, 1);
+      next.splice(targetIndex, 0, moved);
+      return next;
+    });
+  };
+  const nudgeCanvasBlock = (blockId: string, direction: -1 | 1) => {
+    if (!guardEdit()) return;
+    const index = canvasBlocks.findIndex((block) => block.id === blockId);
+    const target = canvasBlocks[index + direction];
+    if (index < 0 || !target) return;
+    moveCanvasBlock(blockId, target.id);
+  };
+  const removeClause = (sectionId: string, clauseId: string) => {
+    if (!guardEdit()) return;
+    const clause = sections
+      .find((section) => section.id === sectionId)
+      ?.clauses.find((item) => item.id === clauseId);
+    rememberCanvasBeforeDelete(clause?.title || "Paragraph");
+    setSections((current) =>
+      current.map((section) =>
+        section.id === sectionId
+          ? {
+              ...section,
+              clauses: section.clauses.filter((item) => item.id !== clauseId),
+            }
+          : section,
+      ),
+    );
+    setActiveClause("");
+    setToast(`Removed ${clause?.title || "paragraph"} from this document`);
+    window.setTimeout(() => setToast(""), 4200);
+  };
+  const moveClauseTo = (
+    sourceSectionId: string,
+    clauseId: string,
+    targetSectionId: string,
+    targetClauseId?: string,
+  ) => {
+    if (!guardEdit()) return;
+    setSections((current) => {
+      const sourceSection = current.find((section) => section.id === sourceSectionId);
+      const moved = sourceSection?.clauses.find((clause) => clause.id === clauseId);
+      if (!moved) return current;
+      const without = current.map((section) =>
+        section.id === sourceSectionId
+          ? { ...section, clauses: section.clauses.filter((clause) => clause.id !== clauseId) }
+          : section,
+      );
+      return without.map((section) => {
+        if (section.id !== targetSectionId) return section;
+        const nextClauses = [...section.clauses];
+        const targetIndex = targetClauseId
+          ? nextClauses.findIndex((clause) => clause.id === targetClauseId)
+          : nextClauses.length;
+        nextClauses.splice(targetIndex < 0 ? nextClauses.length : targetIndex, 0, moved);
+        return { ...section, clauses: nextClauses };
+      });
+    });
+    setActiveSection(targetSectionId);
+    setActiveClause(clauseId);
+  };
   const openNewBlankDocument = () => {
     if (!guardEdit()) return;
-    const id = `blank-${Date.now()}`;
-    setSections([
-      {
-        id,
-        title: "New section",
-        clauses: [
-          {
-            id: `${id}-clause`,
-            title: "New paragraph",
-            tag: "Custom",
-            included: true,
-            text: "Start writing your paragraph here.",
-          },
-        ],
-      },
-    ]);
-    setActiveSection(id);
-    setActiveClause(`${id}-clause`);
+    setSections([]);
+    setCanvasBlocks([]);
+    setActiveSection("");
+    setActiveClause("");
+    setActiveCanvasBlock("");
     setDocName("Untitled HR document");
+    setWatermark(makeDefaultWatermark());
     setDocumentMenuOpen(false);
+    setToast("Blank document ready. Add only the elements you need.");
+    window.setTimeout(() => setToast(""), 2400);
   };
   const copyCurrentDocument = () => {
     if (!guardEdit()) return;
-    setSections((prev) =>
-      prev.map((section) => ({
-        ...section,
-        id: `${section.id}-copy-${Date.now()}`,
+    const stamp = Date.now();
+    const sectionIdMap = new Map<string, string>();
+    const copiedSections = sections.map((section) => {
+      const nextSectionId = `${section.id}-copy-${stamp}`;
+      sectionIdMap.set(section.id, nextSectionId);
+      return {
+        ...clone(section),
+        id: nextSectionId,
         clauses: section.clauses.map((clause) => ({
-          ...clause,
-          id: `${clause.id}-copy-${Date.now()}`,
+          ...clone(clause),
+          id: `${clause.id}-copy-${stamp}`,
         })),
-      })),
+      };
+    });
+    setSections(copiedSections);
+    setCanvasBlocks((current) =>
+      current.map((block) => {
+        if (block.kind !== "section" || !block.sectionId) return clone(block);
+        const nextSectionId = sectionIdMap.get(block.sectionId);
+        return nextSectionId
+          ? {
+              ...block,
+              id: `canvas-section-${nextSectionId}`,
+              sectionId: nextSectionId,
+            }
+          : block;
+      }),
     );
     setDocName(`${docName} · Copy`);
+    setWatermark((current) => ({
+      ...current,
+      verificationId: makeVerificationId(),
+    }));
     setDocumentMenuOpen(false);
   };
   const updateClauseText = (id: string, text: string) =>
@@ -2063,7 +2769,19 @@ function App() {
       const next = [...prev];
       const target = index + direction;
       if (target < 0 || target >= next.length) return prev;
+      const sourceId = next[index].id;
+      const targetId = next[target].id;
       [next[index], next[target]] = [next[target], next[index]];
+      setCanvasBlocks((blocks) => {
+        const sourceBlock = blocks.find((block) => block.sectionId === sourceId);
+        const targetBlock = blocks.find((block) => block.sectionId === targetId);
+        if (!sourceBlock || !targetBlock) return blocks;
+        const copy = [...blocks];
+        const sourceBlockIndex = copy.findIndex((block) => block.id === sourceBlock.id);
+        const targetBlockIndex = copy.findIndex((block) => block.id === targetBlock.id);
+        [copy[sourceBlockIndex], copy[targetBlockIndex]] = [copy[targetBlockIndex], copy[sourceBlockIndex]];
+        return copy;
+      });
       return next;
     });
   const buildVersion = (
@@ -2084,6 +2802,7 @@ function App() {
       sections: clone(payload.sections ?? sections),
       values: clone(payload.values ?? values),
       letterhead: clone(payload.letterhead ?? letterhead),
+      watermark: clone(payload.watermark ?? watermark),
       docName: payload.docName ?? docName,
       templateId: payload.templateId ?? templateId,
       personId: payload.personId ?? personId,
@@ -2093,6 +2812,7 @@ function App() {
       manualOverrides: clone(payload.manualOverrides ?? manualOverrides),
       sourceUpdates: clone(payload.sourceUpdates ?? sourceUpdates),
       sourceUpdateMeta: clone(payload.sourceUpdateMeta ?? sourceUpdateMeta),
+      canvasBlocks: clone(payload.canvasBlocks ?? canvasBlocks),
     };
   };
   const createVersion = (
@@ -2108,15 +2828,21 @@ function App() {
     const restoredSections = clone(version.sections);
     const restoredValues = clone(version.values);
     const restoredLetterhead = normalizeLetterhead(version.letterhead);
+    const restoredWatermark = normalizeWatermark(version.watermark || watermark);
     const restoredDocName = version.docName;
     const restoredPersonId = version.personId || personId;
     const restoredTemplateId = version.templateId || templateId;
     const restoredOverrides = clone(version.manualOverrides || []);
     const restoredUpdates = clone(version.sourceUpdates || {});
     const restoredMeta = clone(version.sourceUpdateMeta || sourceUpdateMeta);
+    const restoredCanvasBlocks = clone(
+      version.canvasBlocks || makeDefaultCanvasBlocks(restoredSections),
+    );
     setSections(restoredSections);
+    setCanvasBlocks(restoredCanvasBlocks);
     setValues(restoredValues);
     setLetterhead(restoredLetterhead);
+    setWatermark(restoredWatermark);
     setDocName(restoredDocName);
     setPersonId(restoredPersonId);
     setTemplateId(restoredTemplateId);
@@ -2139,6 +2865,7 @@ function App() {
       sections: restoredSections,
       values: restoredValues,
       letterhead: restoredLetterhead,
+      watermark: restoredWatermark,
       docName: restoredDocName,
       personId: restoredPersonId,
       templateId: restoredTemplateId,
@@ -2148,6 +2875,7 @@ function App() {
       manualOverrides: restoredOverrides,
       sourceUpdates: restoredUpdates,
       sourceUpdateMeta: restoredMeta,
+      canvasBlocks: restoredCanvasBlocks,
     });
     setVersions((prev) => [restoredSnapshot, ...prev].slice(0, 12));
     setRestoreVersionId(null);
@@ -2171,7 +2899,9 @@ function App() {
           personId,
           values,
           letterhead,
+          watermark,
           sections,
+          canvasBlocks,
           docName,
           docStatus: nextStatus,
           customPlaceholders,
@@ -2379,8 +3109,23 @@ function App() {
       ],
     });
   };
+  const watermarkAlignment = () =>
+    watermark.alignment === "left"
+      ? AlignmentType.LEFT
+      : watermark.alignment === "right"
+        ? AlignmentType.RIGHT
+        : AlignmentType.CENTER;
+  const renderDocxWatermark = (text: string) => new Paragraph({
+    alignment: watermarkAlignment(),
+    children: [new TextRun({
+      text,
+      size: 14,
+      color: "7C8699",
+      italics: true,
+    })],
+  });
   const estimatePageCount = () => {
-    const characters = sections
+    const characters = orderedSections
       .flatMap((section) => [section.title, ...section.clauses.filter(shouldShowClause).map(clausePlainText)])
       .join(" ").length;
     return Math.max(1, Math.ceil((characters + docName.length) / 1550));
@@ -2394,40 +3139,70 @@ function App() {
     setExportState("exporting");
     setExportError("");
     try {
+      const exportedAt = new Date();
+      const verificationText = watermarkDisplayText(watermark, exportedAt);
       const firstLayout = layoutForPage(0);
       const subsequentLayout = layoutForPage(1);
-      const firstHeader = new Header({ children: [renderDocxLetterhead(firstLayout)] });
-      const subsequentHeader = new Header({ children: [renderDocxLetterhead(letterhead.mode === "all" ? firstLayout : subsequentLayout)] });
+      const firstHeaderChildren = [
+        ...(hasCanvasBlock("letterhead") ? [renderDocxLetterhead(firstLayout)] : []),
+        ...(watermark.placement === "header" ? [renderDocxWatermark(verificationText)] : []),
+      ];
+      const subsequentHeaderChildren = [
+        ...(hasCanvasBlock("letterhead") && letterhead.mode !== "first"
+          ? [renderDocxLetterhead(letterhead.mode === "all" ? firstLayout : subsequentLayout)]
+          : []),
+        ...(watermark.placement === "header" ? [renderDocxWatermark(verificationText)] : []),
+      ];
+      const firstHeader = new Header({ children: firstHeaderChildren });
+      const subsequentHeader = new Header({ children: subsequentHeaderChildren });
       const footer = new Footer({
         children: [
-          new Paragraph({
+          ...(hasCanvasBlock("footer") ? [new Paragraph({
             alignment: AlignmentType.CENTER,
             children: [new TextRun({ text: `${values.company_name || "Company"} · Confidential · Page ` }), new TextRun({ children: [PageNumber.CURRENT] })],
-          }),
+          })] : []),
+          ...(watermark.placement === "footer" ? [renderDocxWatermark(verificationText)] : []),
         ],
       });
-      const children = [
-        new Paragraph({ text: docName, heading: HeadingLevel.TITLE }),
-        ...sections.flatMap((section) => [
-          new Paragraph({ text: section.title, heading: HeadingLevel.HEADING_1 }),
-          ...section.clauses
-            .filter(shouldShowClause)
-            .map((clause) => new Paragraph({ children: clauseTextRuns(clause) })),
-        ]),
-        new Paragraph({
-          text: `Signed for ${values.company_name} by ${values.signatory_name}, ${values.signatory_title}`,
-        }),
-        new Paragraph({ text: "Employee / Contractor signature: ______________________________" }),
-        new Paragraph({ text: "Date: ____________________" }),
-      ];
+      const children = canvasBlocks.flatMap((block): Paragraph[] => {
+        if (block.kind === "meta") {
+          return [new Paragraph({ text: `${template.type.toUpperCase()} · MY · 2026` })];
+        }
+        if (block.kind === "title") {
+          return [new Paragraph({ text: docName, heading: HeadingLevel.TITLE })];
+        }
+        if (block.kind === "lede") {
+          return [new Paragraph({ text: `Between ${values.company_name || "Company"} and ${values.full_name || "Recipient"}` })];
+        }
+        if (block.kind === "section" && block.sectionId) {
+          const section = sections.find((item) => item.id === block.sectionId);
+          if (!section) return [];
+          return [
+            new Paragraph({ text: section.title, heading: HeadingLevel.HEADING_1 }),
+            ...section.clauses
+              .filter(shouldShowClause)
+              .map((clause) => new Paragraph({ children: clauseTextRuns(clause) })),
+          ];
+        }
+        if (block.kind === "signatures") {
+          return [
+            new Paragraph({
+              text: `Signed for ${values.company_name || "Company"} by ${values.signatory_name || "Company representative"}, ${values.signatory_title || ""}`,
+            }),
+            new Paragraph({ text: "Employee / Contractor signature: ______________________________" }),
+            new Paragraph({ text: "Date: ____________________" }),
+          ];
+        }
+        return [];
+      });
       const blob = await Packer.toBlob(new Document({
         sections: [{
-          headers: letterhead.mode === "first"
-            ? { first: firstHeader }
-            : letterhead.mode === "all"
-              ? { default: subsequentHeader, first: firstHeader }
-              : { default: subsequentHeader, first: firstHeader },
-          footers: { default: footer, first: footer },
+          headers: firstHeaderChildren.length || subsequentHeaderChildren.length
+            ? { default: subsequentHeader, first: firstHeader }
+            : {},
+          footers: hasCanvasBlock("footer") || watermark.placement === "footer"
+            ? { default: footer, first: footer }
+            : {},
           properties: {
             titlePage: letterhead.mode !== "all",
             page: {
@@ -2469,64 +3244,108 @@ function App() {
     setExportState("exporting");
     setExportError("");
     try {
+      const exportedAt = new Date();
+      const verificationText = watermarkDisplayText(watermark, exportedAt);
       const pdf = new jsPDF({ format: letterhead.page === "A4" ? "a4" : "letter", unit: "pt" });
       const pageHeight = pdf.internal.pageSize.getHeight();
       const pageWidth = pdf.internal.pageSize.getWidth();
       const addPageFurniture = (pageIndex: number) => {
         const layout = layoutForPage(pageIndex);
         const imageType = letterheadImageType(layout);
-        if (layout.dataUrl && imageType) {
-          const imageHeight = Math.max(24, layout.width * 0.28);
-          pdf.addImage(layout.dataUrl, imageType === "jpg" ? "JPEG" : imageType.toUpperCase(), layout.left, layout.top, layout.width, imageHeight, undefined, "FAST");
-        } else {
-          pdf.setFont("helvetica", "bold");
-          pdf.setFontSize(10);
-          pdf.setTextColor(layout.accent);
-          pdf.text(values.company_name || "Company Letterhead", layout.left, layout.top + 12);
+        if (hasCanvasBlock("letterhead")) {
+          if (layout.dataUrl && imageType) {
+            const imageHeight = Math.max(24, layout.width * 0.28);
+            pdf.addImage(layout.dataUrl, imageType === "jpg" ? "JPEG" : imageType.toUpperCase(), layout.left, layout.top, layout.width, imageHeight, undefined, "FAST");
+          } else {
+            pdf.setFont("helvetica", "bold");
+            pdf.setFontSize(10);
+            pdf.setTextColor(layout.accent);
+            pdf.text(values.company_name || "Company Letterhead", layout.left, layout.top + 12);
+            pdf.setTextColor("#222222");
+          }
+        }
+        if (hasCanvasBlock("footer")) {
+          pdf.setFont("helvetica", "normal");
+          pdf.setFontSize(8);
+          pdf.setTextColor("#6b7280");
+          pdf.text(`${values.company_name || "Company"} · Confidential · Page ${pageIndex + 1}`, pageWidth / 2, pageHeight - 28, { align: "center" });
           pdf.setTextColor("#222222");
         }
+        pdf.setFont("helvetica", "italic");
+        pdf.setFontSize(7);
+        pdf.setTextColor("#7c8699");
+        const verificationLines = pdf.splitTextToSize(verificationText, pageWidth - 108) as string[];
+        const verificationX = watermark.alignment === "left" ? 54 : watermark.alignment === "right" ? pageWidth - 54 : pageWidth / 2;
+        const verificationY = watermark.placement === "header" ? 14 : pageHeight - 14 - Math.max(0, verificationLines.length - 1) * 8;
+        const verificationAlign = watermark.alignment === "left" ? "left" : watermark.alignment === "right" ? "right" : "center";
+        verificationLines.forEach((line, lineIndex) => {
+          pdf.text(line, verificationX, verificationY + lineIndex * 8, { align: verificationAlign });
+        });
         pdf.setFont("helvetica", "normal");
-        pdf.setFontSize(8);
-        pdf.setTextColor("#6b7280");
-        pdf.text(`${values.company_name || "Company"} · Confidential · Page ${pageIndex + 1}`, pageWidth / 2, pageHeight - 28, { align: "center" });
         pdf.setTextColor("#222222");
       };
       let pageIndex = 0;
       addPageFurniture(pageIndex);
       const firstLayout = layoutForPage(0);
-      let y = Math.max(70, firstLayout.margin || 74);
-      pdf.setFont("helvetica", "bold");
-      pdf.setFontSize(16);
-      pdf.text(docName, 54, y);
-      y += 28;
-      pdf.setFont("helvetica", "normal");
-      pdf.setFontSize(10);
-      sections.forEach((section) => {
-        const visible = section.clauses.filter(shouldShowClause);
-        if (!visible.length) return;
-        if (y > pageHeight - 90) { pdf.addPage(); pageIndex += 1; addPageFurniture(pageIndex); y = Math.max(58, layoutForPage(pageIndex).margin || 58); }
-        pdf.setFont("helvetica", "bold");
-        pdf.setFontSize(12);
-        pdf.text(section.title, 54, y);
-        y += 18;
-        pdf.setFont("helvetica", "normal");
-        pdf.setFontSize(10);
-        visible.forEach((clause) => {
-          const lines = pdf.splitTextToSize(clausePlainText(clause), 490);
-          lines.forEach((line: string) => {
-            if (y > pageHeight - 70) { pdf.addPage(); pageIndex += 1; addPageFurniture(pageIndex); y = Math.max(58, layoutForPage(pageIndex).margin || 58); }
-            pdf.text(line, 54, y);
-            y += 14;
+      let y = hasCanvasBlock("letterhead") ? Math.max(70, firstLayout.margin || 74) : 54;
+      const ensureSpace = (height: number) => {
+        if (y <= pageHeight - height) return;
+        pdf.addPage();
+        pageIndex += 1;
+        addPageFurniture(pageIndex);
+        y = hasCanvasBlock("letterhead") ? Math.max(58, layoutForPage(pageIndex).margin || 58) : 54;
+      };
+      canvasBlocks.forEach((block) => {
+        if (block.kind === "meta") {
+          ensureSpace(28);
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(8);
+          pdf.setTextColor("#64748b");
+          pdf.text(`${template.type.toUpperCase()} · MY · 2026`, 54, y);
+          pdf.setTextColor("#222222");
+          y += 24;
+        } else if (block.kind === "title") {
+          ensureSpace(42);
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(16);
+          pdf.text(docName, 54, y);
+          y += 28;
+        } else if (block.kind === "lede") {
+          ensureSpace(34);
+          pdf.setFont("helvetica", "normal");
+          pdf.setFontSize(10);
+          pdf.text(`Between ${values.company_name || "Company"} and ${values.full_name || "Recipient"}`, 54, y);
+          y += 26;
+        } else if (block.kind === "section" && block.sectionId) {
+          const section = sections.find((item) => item.id === block.sectionId);
+          if (!section) return;
+          const visible = section.clauses.filter(shouldShowClause);
+          ensureSpace(44);
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(12);
+          pdf.text(section.title, 54, y);
+          y += 18;
+          pdf.setFont("helvetica", "normal");
+          pdf.setFontSize(10);
+          visible.forEach((clause) => {
+            const lines = pdf.splitTextToSize(clausePlainText(clause), 490);
+            lines.forEach((line: string) => {
+              ensureSpace(70);
+              pdf.text(line, 54, y);
+              y += 14;
+            });
+            y += 6;
           });
-          y += 6;
-        });
+        } else if (block.kind === "signatures") {
+          ensureSpace(130);
+          pdf.setFont("helvetica", "bold");
+          pdf.text(`Signed for ${values.company_name || "Company"} by ${values.signatory_name || "Company representative"}, ${values.signatory_title || ""}`, 54, y + 20);
+          pdf.setFont("helvetica", "normal");
+          pdf.text("Employee / Contractor signature: ______________________________", 54, y + 48);
+          pdf.text("Date: ____________________", 54, y + 68);
+          y += 88;
+        }
       });
-      if (y > pageHeight - 130) { pdf.addPage(); pageIndex += 1; addPageFurniture(pageIndex); y = Math.max(58, layoutForPage(pageIndex).margin || 58); }
-      pdf.setFont("helvetica", "bold");
-      pdf.text(`Signed for ${values.company_name} by ${values.signatory_name}, ${values.signatory_title}`, 54, y + 20);
-      pdf.setFont("helvetica", "normal");
-      pdf.text("Employee / Contractor signature: ______________________________", 54, y + 48);
-      pdf.text("Date: ____________________", 54, y + 68);
       const fileName = `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.pdf`;
       const pdfContentBase64 = await blobToDataUrl(pdf.output("blob"));
       pdf.save(fileName);
@@ -2576,9 +3395,11 @@ function App() {
     sections: clone(sections),
     values: clone(values),
     letterhead: clone(letterhead),
+    watermark: clone(watermark),
     versions: clone(versions),
     exports: clone(appStore.documents.find((item) => item.id === "doc-current")?.exports || []),
     updatedAt: formatDocumentStamp(),
+    canvasBlocks: clone(canvasBlocks),
   });
   const persistCurrentDocumentRecord = () => {
     try {
@@ -2597,19 +3418,78 @@ function App() {
       return false;
     }
   };
+  const signOutOfWorkspace = () => {
+    if (activeModule === "workspace" && !persistCurrentDocumentRecord()) {
+      setAccountMenuOpen(false);
+      return;
+    }
+    setAccountMenuOpen(false);
+    onSignOut();
+  };
   const switchModule = (module: AppModule) => {
     if (module === activeModule) return;
     if (activeModule === "workspace" && !persistCurrentDocumentRecord()) return;
     window.location.hash = module;
     setActiveModule(module);
   };
-  const moduleTitle = navItems.find(([id]) => id === activeModule)?.[1] || "Workspace";
+  const openWorkspaceTool = (
+    tab: "outline" | "person" | "placeholders" | "clauses" | "letterhead" | "review",
+    library?: "clauses" | "placeholders" | "layouts",
+  ) => {
+    setActiveRightTab(tab);
+    setWorkspacePanelOpen(true);
+    setWorkspaceLibraryOpen(library || null);
+    setShowPreview(false);
+  };
+  const handlePrimaryNavigation = (module: AppModule) => {
+    if (activeModule === "workspace") {
+      const target = module === "workspace"
+        ? { tab: "outline" as const, library: undefined }
+        : module === "clauses"
+          ? { tab: "clauses" as const, library: "clauses" as const }
+          : module === "placeholders"
+            ? { tab: "placeholders" as const, library: "placeholders" as const }
+            : module === "layouts"
+              ? { tab: "letterhead" as const, library: "layouts" as const }
+              : null;
+      if (target) {
+        if (workspacePanelOpen && activeRightTab === target.tab) {
+          setWorkspacePanelOpen(false);
+          setWorkspaceToolMenuOpen(false);
+          return;
+        }
+        return openWorkspaceTool(target.tab, target.library);
+      }
+    }
+    if (module === "workspace") {
+      switchModule(module);
+      setActiveRightTab("outline");
+      setWorkspacePanelOpen(true);
+      return;
+    }
+    switchModule(module);
+  };
+  const moduleTitle = activeModule === "settings"
+    ? "Email Settings"
+    : navItems.find(([id]) => id === activeModule)?.[1] || "Workspace";
   const filteredClauses = appStore.clauses.filter((clause) => {
     const matchesSearch = !moduleSearch || `${clause.title} ${clause.category} ${clause.tags.join(" ")}`.toLowerCase().includes(moduleSearch.toLowerCase());
     const matchesFilter = moduleFilter === "all" || clause.status === moduleFilter;
     return matchesSearch && matchesFilter;
   });
   const selectedGroup = appStore.placeholderGroups.find((group) => group.id === (selectedPlaceholderGroupId || appStore.placeholderGroups[0]?.id));
+  const workspaceClauseRecords = appStore.clauses.filter((record) =>
+    record.status !== "inactive" &&
+    (!workspaceLibrarySearch || `${record.title} ${record.category} ${record.tags.join(" ")}`.toLowerCase().includes(workspaceLibrarySearch.toLowerCase())),
+  );
+  const workspacePlaceholderGroups = appStore.placeholderGroups.filter((group) =>
+    group.status !== "inactive" &&
+    (!workspaceLibrarySearch || `${group.name} ${group.sourceType} ${group.fields.map((field) => field.label).join(" ")}`.toLowerCase().includes(workspaceLibrarySearch.toLowerCase())),
+  );
+  const workspaceLayoutRecords = appStore.layouts.filter((record) =>
+    record.status !== "inactive" &&
+    (!workspaceLibrarySearch || record.name.toLowerCase().includes(workspaceLibrarySearch.toLowerCase())),
+  );
   const updateClauseDraft = (patch: Partial<ClauseRecord>) => setClauseDraft((current) => current ? { ...current, ...patch, updatedAt: formatDocumentStamp() } : current);
   const saveClauseDraft = (publish = false) => {
     if (!clauseDraft || currentRole !== "Admin" && publish) return;
@@ -2726,6 +3606,10 @@ function App() {
       clauses: insertedClauses,
     };
     setSections((current) => [...current, section]);
+    setCanvasBlocks((current) => [
+      ...current,
+      { id: `canvas-section-${section.id}`, kind: "section", sectionId: section.id },
+    ]);
     setActiveSection(section.id);
     setActiveClause(insertedClauses[0]?.id || "");
     setModuleNotice(`${record.title} inserted as a document copy`);
@@ -2750,6 +3634,7 @@ function App() {
         sections: clone(sections),
         values: clone(values),
         letterhead: clone(letterhead),
+        watermark: clone(watermark),
         docName,
         templateId,
         personId,
@@ -2757,6 +3642,7 @@ function App() {
         generationStatus: status === "generated" ? "generated" : "failed",
         exports: status === "failed" ? existing.exports : [exportRecord, ...existing.exports],
         updatedAt: formatDocumentStamp(),
+        canvasBlocks: clone(canvasBlocks),
       };
       return { ...current, exports: [exportRecord, ...current.exports], documents: [nextDocument, ...current.documents.filter((item) => item.id !== "doc-current")] };
     });
@@ -2778,7 +3664,543 @@ function App() {
     link.click();
     URL.revokeObjectURL(url);
   };
+  const renderCanvasBlock = (block: CanvasBlock, blockIndex: number) => {
+    const selected = activeCanvasBlock === block.id;
+    const section = block.sectionId
+      ? sections.find((item) => item.id === block.sectionId)
+      : null;
+    const dropCanvasItem = (event: React.DragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      if (!canvasDrag) return;
+      if (canvasDrag.type === "block") {
+        moveCanvasBlock(canvasDrag.id, block.id);
+      } else if (section) {
+        moveClauseTo(canvasDrag.sectionId, canvasDrag.id, section.id);
+      }
+      setCanvasDrag(null);
+    };
+    const controls = (
+      <div className="canvas-block-controls" aria-label="Element controls">
+        <button
+          className="canvas-drag-handle"
+          title="Drag to reposition"
+          aria-label="Drag element"
+          draggable={canEditDocument}
+          onDragStart={(event) => {
+            event.dataTransfer.effectAllowed = "move";
+            setCanvasDrag({ type: "block", id: block.id });
+          }}
+          onDragEnd={() => setCanvasDrag(null)}
+        >
+          <GripVertical size={14} />
+        </button>
+        <span>{block.kind === "section" ? "Section" : block.kind}</span>
+        <button
+          title="Move up"
+          aria-label="Move element up"
+          disabled={blockIndex === 0}
+          onClick={(event) => {
+            event.stopPropagation();
+            nudgeCanvasBlock(block.id, -1);
+          }}
+        >
+          <ArrowUp size={13} />
+        </button>
+        <button
+          title="Move down"
+          aria-label="Move element down"
+          disabled={blockIndex === canvasBlocks.length - 1}
+          onClick={(event) => {
+            event.stopPropagation();
+            nudgeCanvasBlock(block.id, 1);
+          }}
+        >
+          <ArrowDown size={13} />
+        </button>
+        <button
+          className="danger"
+          title="Delete from document"
+          aria-label="Delete element"
+          onClick={(event) => {
+            event.stopPropagation();
+            removeCanvasBlock(block);
+          }}
+        >
+          <Trash2 size={13} />
+        </button>
+      </div>
+    );
+    const shell = (content: React.ReactNode, className = "") => (
+      <div
+        className={`canvas-block ${className} ${selected ? "selected" : ""} ${canvasDrag?.type === "block" && canvasDrag.id === block.id ? "dragging" : ""}`}
+        key={block.id}
+        data-canvas-block={block.kind}
+        data-section-id={section?.id}
+        onClick={(event) => {
+          event.stopPropagation();
+          setActiveCanvasBlock(block.id);
+          if (section) {
+            setActiveSection(section.id);
+            setActiveClause(section.clauses[0]?.id || "");
+          }
+        }}
+        onDragOver={(event) => {
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "move";
+        }}
+        onDrop={dropCanvasItem}
+      >
+        {controls}
+        {content}
+      </div>
+    );
+
+    if (block.kind === "letterhead") {
+      const layout = letterhead.firstPage || letterhead;
+      return shell(
+        <div
+          className="canvas-letterhead-space"
+          style={{ minHeight: `${Math.max(56, layout.top + 46)}px` }}
+        >
+          <div
+            className="letterhead-preview"
+            style={{
+              left: `${layout.left}px`,
+              top: `${layout.top}px`,
+              width: `${layout.width}px`,
+              opacity: layout.opacity,
+              backgroundImage: layout.dataUrl ? `url(${layout.dataUrl})` : undefined,
+              backgroundSize: "contain",
+              backgroundRepeat: "no-repeat",
+            }}
+          >
+            {!layout.dataUrl && <>
+              <div className="lh-brand">
+                <div className="lh-logo" style={{ background: layout.accent }}>N</div>
+                <div>
+                  <strong>Northstar Labs</strong>
+                  <span>People & Culture</span>
+                </div>
+              </div>
+              <div className="lh-lines" style={{ background: layout.accent }} />
+            </>}
+          </div>
+        </div>,
+        "canvas-letterhead-block",
+      );
+    }
+    if (block.kind === "meta") {
+      return shell(
+        <div className="page-meta">
+          <span>{template.type.toUpperCase()}</span>
+          <span>MY · 2026</span>
+        </div>,
+      );
+    }
+    if (block.kind === "title") {
+      return shell(
+        <h1
+          contentEditable={canEditDocument}
+          suppressContentEditableWarning
+          onBlur={(event) => renameDocument(event.currentTarget.textContent || docName)}
+        >
+          {docName}
+        </h1>,
+        "canvas-title-block",
+      );
+    }
+    if (block.kind === "lede") {
+      return shell(
+        <p className="lede">
+          Between <mark>{values.company_name || "Company"}</mark> and{" "}
+          <mark>{values.full_name || "Recipient"}</mark>
+        </p>,
+      );
+    }
+    if (block.kind === "section" && section) {
+      const sectionNumber = orderedSections.findIndex((item) => item.id === section.id) + 1;
+      return shell(
+        <section className={`doc-section ${activeSection === section.id ? "active" : ""}`}>
+          <div className="section-label">
+            <span>{String(Math.max(1, sectionNumber)).padStart(2, "0")}</span>
+            <h2
+              contentEditable={canEditDocument}
+              suppressContentEditableWarning
+              onBlur={(event) => {
+                const title = event.currentTarget.textContent?.trim() || section.title;
+                setSections((current) =>
+                  current.map((item) => item.id === section.id ? { ...item, title } : item),
+                );
+              }}
+            >
+              {section.title}
+            </h2>
+            <button
+              className="section-options"
+              title="Add paragraph"
+              onClick={(event) => {
+                event.stopPropagation();
+                addClause(section.id, true);
+              }}
+            >
+              <Plus size={14} />
+            </button>
+          </div>
+          {section.clauses.map((clause, cIndex) =>
+            shouldShowClause(clause) ? (
+              <div
+                className={`clause ${activeClause === clause.id ? "active" : ""} ${canvasDrag?.type === "clause" && canvasDrag.id === clause.id ? "dragging" : ""}`}
+                key={clause.id}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setActiveClause(clause.id);
+                  setActiveSection(section.id);
+                  setActiveCanvasBlock(block.id);
+                }}
+                onDragOver={(event) => {
+                  if (canvasDrag?.type !== "clause") return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  event.dataTransfer.dropEffect = "move";
+                }}
+                onDrop={(event) => {
+                  if (canvasDrag?.type !== "clause") return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  moveClauseTo(canvasDrag.sectionId, canvasDrag.id, section.id, clause.id);
+                  setCanvasDrag(null);
+                }}
+              >
+                <button
+                  className="clause-drag-handle"
+                  title="Drag paragraph"
+                  aria-label="Drag paragraph"
+                  draggable={canEditDocument}
+                  onDragStart={(event) => {
+                    event.stopPropagation();
+                    event.dataTransfer.effectAllowed = "move";
+                    setCanvasDrag({ type: "clause", id: clause.id, sectionId: section.id });
+                  }}
+                  onDragEnd={() => setCanvasDrag(null)}
+                >
+                  <GripVertical size={13} />
+                </button>
+                <div className="clause-number">{sectionNumber}.{cIndex + 1}</div>
+                <div className="clause-content">
+                  <div className="clause-title">
+                    <span
+                      contentEditable={canEditDocument}
+                      suppressContentEditableWarning
+                      onBlur={(event) => {
+                        const title = event.currentTarget.textContent?.trim() || clause.title;
+                        setSections((current) => current.map((item) => ({
+                          ...item,
+                          clauses: item.clauses.map((candidate) => candidate.id === clause.id ? { ...candidate, title } : candidate),
+                        })));
+                      }}
+                    >
+                      {clause.title}
+                    </span>
+                    <span className={`tag ${clause.tag.toLowerCase()}`}>{clause.tag}</span>
+                  </div>
+                  <div
+                    className="editable-paragraph"
+                    data-clause-id={clause.id}
+                    contentEditable={canEditDocument}
+                    suppressContentEditableWarning
+                    onFocus={(event) => {
+                      activeEditorRef.current = event.currentTarget;
+                      rememberSelection();
+                    }}
+                    onMouseUp={rememberSelection}
+                    onKeyUp={rememberSelection}
+                    onBlur={(event) => updateClauseHtml(clause.id, event.currentTarget.innerHTML)}
+                    dangerouslySetInnerHTML={{ __html: clauseHtml(clause) }}
+                  />
+                  <div className="clause-actions">
+                    <button onClick={() => toggleClause(clause.id)}><Archive size={12} /> Exclude</button>
+                    <button onClick={() => duplicateClause(section.id, clause)}><Copy size={12} /> Duplicate</button>
+                    <button onClick={() => addClause(section.id, true)}><Plus size={12} /> Insert below</button>
+                    <button className="delete-action" onClick={() => removeClause(section.id, clause.id)}><Trash2 size={12} /> Delete</button>
+                  </div>
+                </div>
+              </div>
+            ) : clause.included ? null : (
+              <div className="excluded-clause" key={clause.id}>
+                <Archive size={13} />
+                <span>{clause.title} excluded</span>
+                <button onClick={() => toggleClause(clause.id)}>Restore</button>
+                <button className="delete-action" onClick={() => removeClause(section.id, clause.id)}>Delete</button>
+              </div>
+            ),
+          )}
+          {!section.clauses.length && (
+            <button className="empty-section-add" onClick={() => addClause(section.id, true)}>
+              <Plus size={14} /> Add paragraph
+            </button>
+          )}
+        </section>,
+        "canvas-section-block",
+      );
+    }
+    if (block.kind === "signatures") {
+      return shell(
+        <div className="signatures">
+          <div>
+            <div className="sign-line" />
+            <strong>{values.signatory_name || "Company representative"}</strong>
+            <span>{values.signatory_title || "Title"}</span>
+            <small>Date: __________________</small>
+          </div>
+          <div>
+            <div className="sign-line" />
+            <strong>{values.full_name || "Employee / Contractor"}</strong>
+            <span>Employee / Contractor</span>
+            <small>Date: __________________</small>
+          </div>
+        </div>,
+      );
+    }
+    if (block.kind === "footer") {
+      return shell(
+        <div className="page-footer">
+          <span>{values.company_name || "Company"} · Confidential</span>
+          <span>Page 1 of {estimatePageCount()}</span>
+        </div>,
+      );
+    }
+    return null;
+  };
+  const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  const updateEmailSetting = <Key extends keyof EmailSettings>(key: Key, value: EmailSettings[Key]) => {
+    setEmailSettings((current) => ({ ...current, [key]: value }));
+    setEmailSettingsErrors((current) => ({ ...current, [key]: undefined }));
+    setEmailSettingsStatus("idle");
+  };
+  const validateEmailSetup = (includeCredential = false) => {
+    const errors: EmailSettingsErrors = {};
+    if (includeCredential) {
+      if (!emailSettings.gmailAddress.trim()) errors.gmailAddress = "Enter the Gmail address used to send documents.";
+      else if (!emailPattern.test(emailSettings.gmailAddress.trim())) errors.gmailAddress = "Enter a valid email address.";
+      if (emailSettings.gmailAppPassword.replace(/\s+/g, "").length !== 16) errors.gmailAppPassword = "Paste the 16-character Gmail App Password.";
+    }
+    if (!emailSettings.senderName.trim()) errors.senderName = "Enter the sender name recipients should see.";
+    if (emailSettings.replyToEmail.trim() && !emailPattern.test(emailSettings.replyToEmail.trim())) {
+      errors.replyToEmail = "Enter a valid reply-to email address.";
+    }
+    if (emailSettings.receiveCopies && !emailSettings.documentInboxEmail.trim()) errors.documentInboxEmail = "Choose where document copies should be delivered.";
+    else if (emailSettings.documentInboxEmail.trim() && !emailPattern.test(emailSettings.documentInboxEmail.trim())) errors.documentInboxEmail = "Enter a valid document inbox address.";
+    if (emailSettings.notificationsEnabled && !emailSettings.notificationEmail.trim()) errors.notificationEmail = "Choose where system notifications should be delivered.";
+    else if (emailSettings.notificationEmail.trim() && !emailPattern.test(emailSettings.notificationEmail.trim())) errors.notificationEmail = "Enter a valid notification email address.";
+    return errors;
+  };
+  const applyEmailConnection = (connection: EmailConnectionSummary) => {
+    setEmailConnection(connection);
+    setEmailSettings({
+      ...clone(defaultEmailSettings),
+      authMethod: connection.authMethod,
+      gmailAddress: connection.senderEmail,
+      senderName: connection.senderName,
+      replyToEmail: connection.replyToEmail,
+      documentInboxEmail: connection.documentInboxEmail,
+      notificationEmail: connection.notificationEmail,
+      sendDocuments: connection.sendDocuments,
+      receiveCopies: connection.receiveCopies,
+      notificationsEnabled: connection.notificationsEnabled,
+    });
+  };
+  const readEmailApiResponse = async (response: Response) => {
+    const result = await response.json().catch(() => ({ ok: false, error: "The email service returned an invalid response." })) as {
+      ok?: boolean;
+      error?: string;
+      connection?: EmailConnectionSummary;
+      deliveredTo?: string;
+    };
+    if (!response.ok || !result.ok) throw new Error(result.error || "The email service could not complete this action.");
+    return result;
+  };
+  const connectGoogleEmail = () => {
+    if (!emailPlatform.googleOAuthReady) {
+      setEmailSettingsError("Google OAuth must be configured by a platform administrator before users can connect accounts.");
+      return;
+    }
+    window.location.assign("/api/email-connections/oauth/start?returnTo=%2F%3Femail%3Dconnected%23settings");
+  };
+  const saveAppPasswordConnection = async () => {
+    const errors = validateEmailSetup(true);
+    setEmailSettingsErrors(errors);
+    if (Object.keys(errors).length) return;
+    setEmailSettingsStatus("saving");
+    setEmailSettingsError("");
+    try {
+      const response = await fetch("/api/email-connections/app-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(emailSettings),
+      });
+      const result = await readEmailApiResponse(response);
+      if (result.connection) applyEmailConnection(result.connection);
+      setEmailSettings((current) => ({ ...current, gmailAppPassword: "" }));
+      setShowGmailAppPassword(false);
+      setEmailAdvancedOpen(false);
+      setEmailSettingsStatus("saved");
+      setModuleNotice("Gmail connected to this workspace");
+    } catch (error) {
+      setEmailSettingsStatus("error");
+      setEmailSettingsError(error instanceof Error ? error.message : "Could not save email settings");
+    }
+  };
+  const saveEmailPreferences = async () => {
+    const errors = validateEmailSetup(false);
+    setEmailSettingsErrors(errors);
+    if (Object.keys(errors).length) return;
+    setEmailSettingsStatus("saving");
+    setEmailSettingsError("");
+    try {
+      const response = await fetch("/api/email-connections/update", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(emailSettings),
+      });
+      const result = await readEmailApiResponse(response);
+      if (result.connection) applyEmailConnection(result.connection);
+      setEmailSettingsStatus("saved");
+      setModuleNotice("Email delivery settings saved");
+    } catch (error) {
+      setEmailSettingsStatus("error");
+      setEmailSettingsError(error instanceof Error ? error.message : "Could not save email settings");
+    }
+  };
+  const sendEmailConnectionTest = async () => {
+    setEmailSettingsStatus("saving");
+    setEmailSettingsError("");
+    try {
+      const response = await fetch("/api/email-connections/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ targetEmail: emailSettings.notificationEmail || emailSettings.replyToEmail || emailSettings.gmailAddress }),
+      });
+      const result = await readEmailApiResponse(response);
+      setEmailSettingsStatus("saved");
+      setModuleNotice(`Test email sent to ${result.deliveredTo || "the configured inbox"}`);
+    } catch (error) {
+      setEmailSettingsStatus("error");
+      setEmailSettingsError(error instanceof Error ? error.message : "The test email could not be delivered.");
+    }
+  };
+  const disconnectEmailAccount = async () => {
+    if (!window.confirm("Disconnect this Gmail account from the current workspace? Existing documents will not be changed.")) return;
+    setEmailSettingsStatus("saving");
+    setEmailSettingsError("");
+    try {
+      const response = await fetch("/api/email-connections/disconnect", { method: "DELETE", headers: { Accept: "application/json" } });
+      await readEmailApiResponse(response);
+      setEmailConnection(null);
+      setEmailSettings(clone(defaultEmailSettings));
+      setEmailSettingsStatus("idle");
+      setModuleNotice("Email account disconnected");
+    } catch (error) {
+      setEmailSettingsStatus("error");
+      setEmailSettingsError(error instanceof Error ? error.message : "The account could not be disconnected.");
+    }
+  };
+  const renderEmailSettingsPage = () => {
+    const connected = Boolean(emailConnection && emailConnection.status !== "disconnected");
+    const connectionHealthy = emailConnection?.status === "connected";
+    const settingsLocked = currentRole === "Reviewer" || emailSettingsStatus === "saving";
+    return (
+      <section className="module-page email-settings-page">
+        <div className="module-header email-settings-header">
+          <div>
+            <span className="eyebrow">WORKSPACE SETTINGS</span>
+            <h1>Email connections</h1>
+            <p>Connect a sender once, then use it for document delivery and workflow notifications in this workspace.</p>
+          </div>
+          <div className={`email-environment-status ${connected && connectionHealthy ? "ready" : emailPlatform.ready ? "pending" : "remote"}`}>
+            {emailSettingsStatus === "loading" ? <RefreshCw size={15} /> : connected && connectionHealthy ? <CheckCircle2 size={15} /> : emailPlatform.ready ? <Mail size={15} /> : <Cloud size={15} />}
+            <span><strong>{emailSettingsStatus === "loading" ? "Checking connection" : connected && connectionHealthy ? "Gmail connected" : emailPlatform.ready ? "Not connected" : "Cloud setup required"}</strong><small>{connected ? `${emailConnection?.senderEmail} · ${emailConnection?.authMethod === "oauth" ? "Google OAuth" : "App Password"}` : "Northstar Labs Malaysia workspace"}</small></span>
+          </div>
+        </div>
+        <div className="email-saas-context" aria-label="Email connection ownership">
+          <div><Cloud size={15} /><span><small>Workspace</small><strong>Northstar Labs Malaysia</strong></span></div>
+          <div><UserRound size={15} /><span><small>Connected by</small><strong>{authSession.displayName}</strong></span></div>
+          <div><ShieldCheck size={15} /><span><small>Credential storage</small><strong>{emailPlatform.ready ? "Encrypted cloud record" : "Not configured"}</strong></span></div>
+        </div>
+
+        {!emailPlatform.ready && (
+          <div className="email-platform-blocker" role="alert">
+            <span className="email-platform-icon"><Cloud size={19} /></span>
+            <div><strong>Cloud email connections need platform setup</strong><p>{currentRole === "Admin" ? "Add the platform variables below in Vercel, configure trusted server authentication, then redeploy. User credentials will be stored per workspace in the database, not in .env files." : "A workspace administrator must finish cloud credential storage and trusted authentication before you can connect Gmail."}</p>
+              {currentRole === "Admin" && emailPlatform.missing.length > 0 && <div className="email-config-chips">{emailPlatform.missing.map((item) => <code key={item}>{item}</code>)}</div>}
+            </div>
+          </div>
+        )}
+
+        {emailSettingsError && <div className="email-settings-error" role="alert"><AlertTriangle size={16} /><span>{emailSettingsError}</span></div>}
+        {emailSettingsStatus === "saved" && <div className="email-settings-success" role="status"><CheckCircle2 size={16} /><span>The workspace email connection has been updated.</span></div>}
+
+        <div className="email-saas-layout">
+          <section className="email-connection-panel">
+            <div className="email-section-heading"><div><span className="eyebrow">SENDING ACCOUNT</span><h2>{connected ? "Connected Gmail account" : "Connect Gmail"}</h2><p>{connected ? "This account is available to permitted members in the current workspace." : "Google OAuth is recommended because users can revoke access without changing passwords."}</p></div>{connected && <span className={`status-pill ${connectionHealthy ? "published" : "inactive"}`}>{emailConnection?.status}</span>}</div>
+
+            {connected ? (
+              <>
+                <div className="email-connected-account"><span className="email-provider-mark"><Mail size={19} /></span><div><strong>{emailConnection?.senderEmail}</strong><small>{emailConnection?.authMethod === "oauth" ? "Google OAuth" : "Gmail App Password"} · scoped to this workspace</small></div><button className="outline-btn" type="button" disabled={!emailPlatform.googleOAuthReady || settingsLocked} onClick={connectGoogleEmail}><RefreshCw size={14} /> Reconnect</button></div>
+                {emailConnection?.lastError && <div className="email-info-box warning"><AlertTriangle size={16} /><span><strong>Last delivery check failed</strong><small>{emailConnection.lastError}</small></span></div>}
+                <div className="email-form-grid">
+                  <label className="email-field"><span>Sender name</span><input value={emailSettings.senderName} disabled={settingsLocked} onChange={(event) => updateEmailSetting("senderName", event.target.value)} placeholder="Northstar Labs HR" />{emailSettingsErrors.senderName && <small role="alert">{emailSettingsErrors.senderName}</small>}</label>
+                  <label className="email-field"><span>Reply-to email <small>Optional</small></span><input type="email" value={emailSettings.replyToEmail} disabled={settingsLocked} onChange={(event) => updateEmailSetting("replyToEmail", event.target.value)} placeholder={emailSettings.gmailAddress || "hr@company.com"} />{emailSettingsErrors.replyToEmail && <small role="alert">{emailSettingsErrors.replyToEmail}</small>}</label>
+                </div>
+                <div className="email-sender-preview"><span className="email-sender-avatar">{(emailSettings.senderName || "H").slice(0, 1).toUpperCase()}</span><span><small>Recipients will see</small><strong>{emailSettings.senderName || "Your sender name"}</strong><small>{emailSettings.gmailAddress}</small></span></div>
+              </>
+            ) : (
+              <>
+                <div className="email-provider-row"><span className="email-provider-mark"><Mail size={18} /></span><span><strong>Google Workspace or Gmail</strong><small>Secure OAuth connection with Gmail send permission</small></span><button className="primary-btn" type="button" disabled={!emailPlatform.googleOAuthReady || settingsLocked} onClick={connectGoogleEmail}><Cloud size={14} /> Connect Gmail</button></div>
+                <div className="email-info-box"><Lock size={16} /><span><strong>No Gmail password is shared with ZhiReady</strong><small>Google issues a revocable token. The refresh token is encrypted on the server and never returned to the browser.</small></span></div>
+                <button className="email-advanced-toggle" type="button" aria-expanded={emailAdvancedOpen} onClick={() => setEmailAdvancedOpen((current) => !current)}><KeyRound size={15} /><span><strong>Use a Gmail App Password instead</strong><small>Advanced compatibility option for accounts where OAuth is unavailable</small></span><ChevronDown size={15} /></button>
+                {emailAdvancedOpen && <div className="email-advanced-panel">
+                  <div className="gmail-tutorial compact"><div><span>1</span><p>Turn on 2-Step Verification in the Google account.</p></div><div><span>2</span><p>Create an App Password named <strong>ZhiReady</strong>.</p></div><div><span>3</span><p>Paste the 16-character password below, then connect.</p></div></div>
+                  <a className="email-help-link" href="https://support.google.com/accounts/answer/185833" target="_blank" rel="noreferrer">Google App Password instructions <ChevronRight size={14} /></a>
+                  <div className="email-form-grid">
+                    <label className="email-field"><span>Gmail address</span><input type="email" value={emailSettings.gmailAddress} disabled={settingsLocked} onChange={(event) => updateEmailSetting("gmailAddress", event.target.value)} placeholder="you@gmail.com" autoComplete="email" />{emailSettingsErrors.gmailAddress && <small role="alert">{emailSettingsErrors.gmailAddress}</small>}</label>
+                    <label className="email-field"><span>Sender name</span><input value={emailSettings.senderName} disabled={settingsLocked} onChange={(event) => updateEmailSetting("senderName", event.target.value)} placeholder="Northstar Labs HR" />{emailSettingsErrors.senderName && <small role="alert">{emailSettingsErrors.senderName}</small>}</label>
+                  </div>
+                  <label className="email-field"><span>Gmail App Password</span><span className="email-secret-field"><input type={showGmailAppPassword ? "text" : "password"} value={emailSettings.gmailAppPassword} disabled={settingsLocked} onChange={(event) => updateEmailSetting("gmailAppPassword", event.target.value)} placeholder="16-character App Password" autoComplete="new-password" /><button type="button" onClick={() => setShowGmailAppPassword((current) => !current)} aria-label={showGmailAppPassword ? "Hide App Password" : "Show App Password"}>{showGmailAppPassword ? <EyeOff size={15} /> : <Eye size={15} />}</button></span>{emailSettingsErrors.gmailAppPassword && <small role="alert">{emailSettingsErrors.gmailAppPassword}</small>}</label>
+                  <div className="email-panel-actions"><span><Lock size={13} /> Cleared from the form after encrypted storage</span><button className="primary-btn" type="button" disabled={!emailPlatform.ready || settingsLocked} onClick={saveAppPasswordConnection}><KeyRound size={14} /> {emailSettingsStatus === "saving" ? "Connecting..." : "Connect with App Password"}</button></div>
+                </div>}
+              </>
+            )}
+          </section>
+
+          <aside className="email-security-panel">
+            <ShieldCheck size={19} />
+            <h3>SaaS credential boundary</h3>
+            <p>Each connection belongs to one user and one company workspace. Switching companies never reuses another workspace's sender.</p>
+            <dl><div><dt>Storage</dt><dd>AES-256-GCM encrypted</dd></div><div><dt>Browser</dt><dd>No password persistence</dd></div><div><dt>Access</dt><dd>Server session required</dd></div><div><dt>Revocation</dt><dd>Reconnect or disconnect anytime</dd></div></dl>
+          </aside>
+        </div>
+
+        {connected && <section className="email-delivery-panel">
+          <div className="email-section-heading"><div><span className="eyebrow">DELIVERY & NOTIFICATIONS</span><h2>Workspace delivery rules</h2><p>Control which emails this connection may send and where operational copies arrive.</p></div></div>
+          <div className="email-preferences-grid">
+            <div className="email-preference-stack">
+              <label className="email-preference-row"><input type="checkbox" disabled={settingsLocked} checked={emailSettings.sendDocuments} onChange={(event) => updateEmailSetting("sendDocuments", event.target.checked)} /><span className="email-preference-icon"><Send size={16} /></span><span><strong>Send generated documents</strong><small>Deliver approved Word and PDF files from this sender.</small></span></label>
+              <label className="email-preference-row"><input type="checkbox" disabled={settingsLocked} checked={emailSettings.receiveCopies} onChange={(event) => updateEmailSetting("receiveCopies", event.target.checked)} /><span className="email-preference-icon"><Inbox size={16} /></span><span><strong>Receive document copies</strong><small>Keep a copy of completed document delivery emails.</small></span></label>
+              <label className="email-preference-row"><input type="checkbox" disabled={settingsLocked} checked={emailSettings.notificationsEnabled} onChange={(event) => updateEmailSetting("notificationsEnabled", event.target.checked)} /><span className="email-preference-icon"><Bell size={16} /></span><span><strong>Workflow notifications</strong><small>Receive approval, export failure and status notifications.</small></span></label>
+            </div>
+            <div className="email-routing-fields">
+              <label className="email-field"><span>Document copy inbox</span><input type="email" disabled={settingsLocked || !emailSettings.receiveCopies} value={emailSettings.documentInboxEmail} onChange={(event) => updateEmailSetting("documentInboxEmail", event.target.value)} placeholder={emailSettings.gmailAddress} />{emailSettingsErrors.documentInboxEmail && <small role="alert">{emailSettingsErrors.documentInboxEmail}</small>}</label>
+              <label className="email-field"><span>Notification email</span><input type="email" disabled={settingsLocked || !emailSettings.notificationsEnabled} value={emailSettings.notificationEmail} onChange={(event) => updateEmailSetting("notificationEmail", event.target.value)} placeholder={emailSettings.gmailAddress} />{emailSettingsErrors.notificationEmail && <small role="alert">{emailSettingsErrors.notificationEmail}</small>}</label>
+              <button className="email-use-gmail" type="button" disabled={settingsLocked} onClick={() => { if (emailSettings.receiveCopies) updateEmailSetting("documentInboxEmail", emailSettings.gmailAddress); if (emailSettings.notificationsEnabled) updateEmailSetting("notificationEmail", emailSettings.gmailAddress); }}>Use connected Gmail for enabled inboxes</button>
+            </div>
+          </div>
+          <div className="email-delivery-actions"><button className="delete-action" type="button" disabled={settingsLocked} onClick={disconnectEmailAccount}>Disconnect account</button><div><button className="outline-btn" type="button" disabled={settingsLocked} onClick={sendEmailConnectionTest}><Send size={14} /> Send test email</button><button className="primary-btn" type="button" disabled={settingsLocked} onClick={saveEmailPreferences}><Save size={14} /> {emailSettingsStatus === "saving" ? "Saving..." : "Save settings"}</button></div></div>
+        </section>}
+      </section>
+    );
+  };
   const renderModulePage = () => {
+    if (activeModule === "settings") return renderEmailSettingsPage();
     if (activeModule === "clauses") {
       return <section className="module-page">
         <div className="module-header"><div><span className="eyebrow">CONTENT SYSTEM</span><h1>Clauses Library</h1><p>Maintain reusable, versioned content without changing existing document copies.</p></div><button className="primary-btn" onClick={() => openClauseEditor()}><Plus size={15} /> New clause</button></div>
@@ -2827,28 +4249,149 @@ function App() {
         : docStatus === "In review"
           ? "View submission"
           : "Send for review";
+  const workspaceTools = [
+    { id: "outline" as const, label: "Document outline", description: "Template and section order", Icon: PanelLeftOpen },
+    { id: "person" as const, label: "Source data", description: "Onboarding record and sync", Icon: UserRound },
+    { id: "placeholders" as const, label: "Fields", description: "Values and Placeholder groups", Icon: Sparkles },
+    { id: "clauses" as const, label: "Clauses", description: "Included content and library", Icon: Archive },
+    { id: "letterhead" as const, label: "Page layout", description: "Letterhead, margins and watermark", Icon: PanelRight },
+    { id: "review" as const, label: "Review checks", description: "Validate the current document", Icon: FileCheck2 },
+  ];
+  const currentWorkspaceTool = workspaceTools.find((tool) => tool.id === activeRightTab) || workspaceTools[0];
+  const CurrentWorkspaceToolIcon = currentWorkspaceTool.Icon;
+  const chooseWorkspaceTool = (toolId: typeof workspaceTools[number]["id"]) => {
+    if (toolId === "review") goToWorkflowStage("review");
+    else openWorkspaceTool(toolId);
+    setWorkspaceToolMenuOpen(false);
+  };
+  const renderWorkspaceToolSwitcher = () => (
+    <div
+      className="workspace-tool-switcher"
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setWorkspaceToolMenuOpen(false);
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") setWorkspaceToolMenuOpen(false);
+      }}
+    >
+      <div className="workspace-tool-current-row">
+        <button
+          className="workspace-tool-current"
+          type="button"
+          aria-haspopup="menu"
+          aria-expanded={workspaceToolMenuOpen}
+          onClick={() => setWorkspaceToolMenuOpen((open) => !open)}
+        >
+          <span className="workspace-tool-current-icon"><CurrentWorkspaceToolIcon size={15} /></span>
+          <span className="workspace-tool-current-copy">
+            <small>Workspace tool</small>
+            <strong>{currentWorkspaceTool.label}</strong>
+          </span>
+          {activeRightTab === "review" && (
+            <span className={`workspace-tool-status ${blockingIssues.length ? "warning" : "ready"}`}>
+              {blockingIssues.length ? blockingIssues.length : <Check size={11} />}
+            </span>
+          )}
+          <ChevronDown size={14} />
+        </button>
+        <button
+          className="workspace-tool-close"
+          type="button"
+          title="Close workspace tool"
+          aria-label="Close workspace tool"
+          onClick={() => {
+            setWorkspacePanelOpen(false);
+            setWorkspaceToolMenuOpen(false);
+          }}
+        >
+          <X size={15} />
+        </button>
+      </div>
+      {workspaceToolMenuOpen && (
+        <div className="workspace-tool-menu" role="menu">
+          <div className="workspace-tool-menu-heading">Switch tool</div>
+          {workspaceTools.map(({ id, label, description, Icon }) => (
+            <button
+              key={id}
+              className={activeRightTab === id ? "active" : ""}
+              type="button"
+              role="menuitem"
+              onClick={() => chooseWorkspaceTool(id)}
+            >
+              <span className="workspace-tool-menu-icon"><Icon size={14} /></span>
+              <span><strong>{label}</strong><small>{description}</small></span>
+              {id === "review" && blockingIssues.length > 0
+                ? <span className="workspace-tool-menu-count">{blockingIssues.length}</span>
+                : activeRightTab === id
+                  ? <Check size={13} />
+                  : <ChevronRight size={12} />}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}>
       <input ref={letterheadInputRef} type="file" accept=".png,.jpg,.jpeg,.pdf,.docx" hidden onChange={(e) => uploadLetterhead(e.target.files?.[0])} />
       <input ref={placeholderImportInputRef} type="file" accept=".csv,.xlsx,.xls" hidden onChange={(e) => previewPlaceholderImport(e.target.files?.[0])} />
       <aside className={`global-sidebar ${sidebarCollapsed ? "collapsed" : ""}`} aria-label="Primary navigation">
-        <div className="global-sidebar-brand"><div className="brand-mark"><FileText size={16} /></div>{!sidebarCollapsed && <div><strong>HR Doc Generator</strong><small>Northstar workspace</small></div>}</div>
-        <div className="global-workspace-switch"><div className="company-dot">N</div>{!sidebarCollapsed && <div><strong>Northstar Labs</strong><span>Malaysia · MY</span></div>}<ChevronDown size={13} /></div>
         <nav className="global-nav">
-          {navItems.map(([id, label, Icon]) => <button key={id} className={activeModule === id ? "active" : ""} onClick={() => switchModule(id as AppModule)} title={sidebarCollapsed ? label : undefined} aria-label={label} aria-current={activeModule === id ? "page" : undefined}><Icon size={17} /><span>{label}</span></button>)}
+          {navItems.map(([id, label, Icon]) => {
+            const linkedTab = id === "clauses" ? "clauses" : id === "placeholders" ? "placeholders" : id === "layouts" ? "letterhead" : null;
+            const linkedActive = activeModule === "workspace" && linkedTab === activeRightTab;
+            return <button key={id} className={`${activeModule === id ? "active" : ""} ${linkedActive ? "linked-active" : ""}`} onClick={() => handlePrimaryNavigation(id as AppModule)} title={sidebarCollapsed ? label : undefined} aria-label={label} aria-current={activeModule === id ? "page" : undefined}><Icon size={17} /><span>{label}</span></button>;
+          })}
         </nav>
         <div className="global-sidebar-spacer" />
         {!sidebarCollapsed && <div className="global-help"><span className="eyebrow">WORKSPACE</span><strong>Keep your document flow moving</strong><small>Build, review and export from one place.</small></div>}
-        <div className="global-nav global-nav-secondary"><button title="Account" aria-label="Account"><UserRound size={16} /><span>Account</span></button><button title="Members and roles" aria-label="Members and roles"><UsersRound size={16} /><span>Members & roles</span></button><button title="Subscription" aria-label="Subscription"><ShieldCheck size={16} /><span>Subscription</span></button><button title="Settings" aria-label="Settings"><Settings2 size={16} /><span>Settings</span></button><button title={theme === "light" ? "Switch to dark theme" : "Switch to light theme"} aria-label="Toggle theme" onClick={() => setTheme((current) => current === "light" ? "dark" : "light")}>{theme === "light" ? <Moon size={16} /> : <Sun size={16} />}<span>Theme</span></button></div>
+        <div className="global-nav global-nav-secondary">
+          <div
+            className="global-account-item"
+            onBlur={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setAccountMenuOpen(false);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setAccountMenuOpen(false);
+            }}
+          >
+            <button
+              type="button"
+              title="Account"
+              aria-label="Account"
+              aria-haspopup="menu"
+              aria-expanded={accountMenuOpen}
+              onClick={() => setAccountMenuOpen((current) => !current)}
+            >
+              <UserRound size={16} /><span>Account</span>
+            </button>
+            {accountMenuOpen && (
+              <div className="global-account-menu" role="menu">
+                <div className="global-account-profile">
+                  <span>{authSession.displayName.slice(0, 1).toUpperCase()}</span>
+                  <div><strong>{authSession.displayName}</strong><small>{authSession.email || "Blank demo access"}</small></div>
+                </div>
+                <button type="button" role="menuitem" onClick={signOutOfWorkspace}>
+                  <LogOut size={15} /> Sign out
+                </button>
+              </div>
+            )}
+          </div>
+          <button title="Members and roles" aria-label="Members and roles"><UsersRound size={16} /><span>Members & roles</span></button>
+          <button title="Subscription" aria-label="Subscription"><ShieldCheck size={16} /><span>Subscription</span></button>
+          <button className={activeModule === "settings" ? "active" : ""} title="Settings" aria-label="Settings" aria-current={activeModule === "settings" ? "page" : undefined} onClick={() => switchModule("settings")}><Settings2 size={16} /><span>Settings</span></button>
+          <button title={theme === "light" ? "Switch to dark theme" : "Switch to light theme"} aria-label="Toggle theme" onClick={() => setTheme((current) => current === "light" ? "dark" : "light")}>{theme === "light" ? <Moon size={16} /> : <Sun size={16} />}<span>Theme</span></button>
+        </div>
         <button className="sidebar-collapse" onClick={() => setSidebarCollapsed((current) => !current)} aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>{sidebarCollapsed ? <PanelLeftOpen size={16} /> : <><PanelLeftClose size={16} /><span>Collapse</span></>}</button>
       </aside>
       <header className="topbar">
         <div className="brand">
-          <div className="brand-mark">
-            <FileText size={17} />
-          </div>
-          <span>HR Doc Generator</span>
+          <img
+            className="brand-logo"
+            src={theme === "light" ? "/brand/zhiready-light.png" : "/brand/zhiready-dark.png"}
+            alt="ZhiReady"
+          />
           <span className="beta">Workspace</span>
         </div>
         <div className="top-context">
@@ -2929,13 +4472,12 @@ function App() {
               if (blockingIssues.length) {
                 setToast("Fix the highlighted checks before review");
                 window.setTimeout(() => setToast(""), 2400);
-                setShowPreview(true);
+                goToWorkflowStage("review");
                 return;
               }
               if (docStatus === "Approved") return;
               if (docStatus === "In review" && currentRole !== "Reviewer") {
-                setWorkflowStage("review");
-                setShowPreview(true);
+                goToWorkflowStage("review");
                 return;
               }
               if (currentRole === "Reviewer" && docStatus === "In review") {
@@ -3036,8 +4578,9 @@ function App() {
           </button>
         </div>
       </div>}
-      {activeModule === "workspace" ? <div className={`workspace ${leftRailCollapsed ? "left-rail-collapsed" : ""}`}>
+      {activeModule === "workspace" ? <div className={`workspace workspace-panel-${activeRightTab} ${workspacePanelOpen ? "workspace-panel-open" : "workspace-panel-closed"}`}>
         <aside className="left-rail">
+          {renderWorkspaceToolSwitcher()}
           <div className="rail-section">
             <div className="rail-heading">
               <span>DOCUMENT SETUP</span>
@@ -3050,14 +4593,6 @@ function App() {
                   onClick={() => setDocumentMenuOpen((open) => !open)}
                 >
                   <FolderOpen size={14} />
-                </button>
-                <button
-                  className="mini-icon rail-collapse-btn"
-                  title={leftRailCollapsed ? "Expand section navigator" : "Collapse section navigator"}
-                  aria-label={leftRailCollapsed ? "Expand section navigator" : "Collapse section navigator"}
-                  onClick={() => setLeftRailCollapsed((collapsed) => !collapsed)}
-                >
-                  {leftRailCollapsed ? <PanelLeftOpen size={14} /> : <PanelLeftClose size={14} />}
                 </button>
               </div>
             </div>
@@ -3108,14 +4643,11 @@ function App() {
               </button>
             </div>
             <div className="section-list">
-              {sections.map((section, index) => (
+              {orderedSections.map((section, index) => (
                 <div
                   className={`section-row ${activeSection === section.id ? "selected" : ""}`}
                   key={section.id}
-                  onClick={() => {
-                    setActiveSection(section.id);
-                    setActiveClause(section.clauses[0]?.id || "");
-                  }}
+                  onClick={() => focusSection(section.id)}
                 >
                   <GripVertical size={14} className="drag" />
                   <div className="section-info">
@@ -3342,6 +4874,50 @@ function App() {
               </button>
             </div>
             <div className="toolbar-group toolbar-right">
+              <div className="canvas-add-wrap">
+                <button
+                  className="toolbar-btn canvas-add-btn"
+                  title="Add document element"
+                  aria-haspopup="menu"
+                  aria-expanded={addBlockMenuOpen}
+                  onClick={() => setAddBlockMenuOpen((open) => !open)}
+                >
+                  <Plus size={16} />
+                  <span>Add element</span>
+                  <ChevronDown size={12} />
+                </button>
+                {addBlockMenuOpen && (
+                  <div className="canvas-add-menu" role="menu">
+                    <button role="menuitem" onClick={() => addFixedCanvasBlock("title")}><Type size={14} /> Add title</button>
+                    <button role="menuitem" onClick={() => addFixedCanvasBlock("meta")}><FileCheck2 size={14} /> Add document meta</button>
+                    <button role="menuitem" onClick={() => addFixedCanvasBlock("lede")}><AlignLeft size={14} /> Add summary</button>
+                    <button role="menuitem" onClick={() => addSection()}><Plus size={14} /> Add section</button>
+                    <button role="menuitem" onClick={addParagraphElement}><AlignLeft size={14} /> Add paragraph</button>
+                    <button role="menuitem" onClick={() => addFixedCanvasBlock("signatures")}><PenLine size={14} /> Add signatures</button>
+                    <button role="menuitem" onClick={() => addFixedCanvasBlock("letterhead")}><ImagePlus size={14} /> Add letterhead</button>
+                    <button role="menuitem" onClick={() => addFixedCanvasBlock("footer")}><PanelBottom size={14} /> Add footer</button>
+                  </div>
+                )}
+              </div>
+              <button
+                className="toolbar-btn canvas-clear-btn"
+                title="Clear canvas"
+                aria-label="Clear canvas"
+                onClick={clearCanvas}
+              >
+                <Trash2 size={16} />
+              </button>
+              {deletedCanvasSnapshot && (
+                <button
+                  className="toolbar-btn"
+                  title={`Restore ${deletedCanvasSnapshot.label}`}
+                  aria-label="Restore last removed element"
+                  onClick={restoreDeletedCanvasItem}
+                >
+                  <RotateCcw size={16} />
+                </button>
+              )}
+              <span className="toolbar-divider" />
               <button className="toolbar-btn" title="Insert table">
                 <Table2 size={16} />
               </button>
@@ -3387,204 +4963,33 @@ function App() {
                 }
               >
                 <div
-                  className="letterhead-preview"
-                  style={{
-                    left: `${(letterhead.firstPage || letterhead).left}px`,
-                    top: `${(letterhead.firstPage || letterhead).top}px`,
-                    width: `${(letterhead.firstPage || letterhead).width}px`,
-                    opacity: (letterhead.firstPage || letterhead).opacity,
-                    backgroundImage: (letterhead.firstPage || letterhead).dataUrl
-                      ? `url(${(letterhead.firstPage || letterhead).dataUrl})`
-                      : undefined,
-                    backgroundSize: "contain",
-                    backgroundRepeat: "no-repeat",
-                  }}
+                  className={`verification-watermark verification-watermark-${watermark.placement} verification-watermark-${watermark.alignment}`}
+                  aria-label="Document verification watermark"
                 >
-                  {!(letterhead.firstPage || letterhead).dataUrl && <>
-                    <div className="lh-brand">
-                      <div
-                        className="lh-logo"
-                        style={{ background: (letterhead.firstPage || letterhead).accent }}
-                      >
-                        N
-                      </div>
-                      <div>
-                        <strong>Northstar Labs</strong>
-                        <span>People & Culture</span>
+                  {watermarkDisplayText(watermark)}
+                </div>
+                <div className="doc-body canvas-document-body">
+                  {canvasBlocks.length ? (
+                    canvasBlocks.map((block, index) => renderCanvasBlock(block, index))
+                  ) : (
+                    <div className="canvas-empty-state">
+                      <FileText size={24} />
+                      <h2>Blank canvas</h2>
+                      <p>Add only the elements this document needs.</p>
+                      <div className="canvas-empty-actions">
+                        <button className="outline-btn" onClick={() => addSection()}><Plus size={14} /> Add section</button>
+                        <button className="outline-btn" onClick={() => addFixedCanvasBlock("title")}><Type size={14} /> Add title</button>
+                        <button className="outline-btn" onClick={addParagraphElement}><AlignLeft size={14} /> Add paragraph</button>
                       </div>
                     </div>
-                    <div
-                      className="lh-lines"
-                      style={{ background: (letterhead.firstPage || letterhead).accent }}
-                    />
-                  </>}
-                </div>
-                <div className="page-meta">
-                  <span>{template.type.toUpperCase()}</span>
-                  <span>MY · 2026</span>
-                </div>
-                <h1>{template.type}</h1>
-                <p className="lede">
-                  Between <mark>{values.company_name}</mark> and{" "}
-                  <mark>{values.full_name}</mark>
-                </p>
-                <div className="doc-body">
-                  {sections.map((section, sIndex) => (
-                    <section
-                      key={section.id}
-                      className={`doc-section ${activeSection === section.id ? "active" : ""}`}
-                      onClick={() => {
-                        setActiveSection(section.id);
-                        setActiveClause(section.clauses[0]?.id || "");
-                      }}
-                    >
-                      <div className="section-label">
-                        <span>{String(sIndex + 1).padStart(2, "0")}</span>
-                        <h2>{section.title}</h2>
-                        <button
-                          className="section-options"
-                          title="Section options"
-                        >
-                          <MoreHorizontal size={14} />
-                        </button>
-                      </div>
-                      {section.clauses.map((clause, cIndex) =>
-                        shouldShowClause(clause) ? (
-                          <div
-                            className={`clause ${activeClause === clause.id ? "active" : ""}`}
-                            key={clause.id}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setActiveClause(clause.id);
-                              setActiveSection(section.id);
-                            }}
-                          >
-                            <div className="clause-number">
-                              {sIndex + 1}.{cIndex + 1}
-                            </div>
-                            <div className="clause-content">
-                              <div className="clause-title">
-                                {clause.title}
-                                <span
-                                  className={`tag ${clause.tag.toLowerCase()}`}
-                                >
-                                  {clause.tag}
-                                </span>
-                              </div>
-                              <div
-                                className="editable-paragraph"
-                                data-clause-id={clause.id}
-                                contentEditable={canEditDocument}
-                                suppressContentEditableWarning
-                                onFocus={(e) => {
-                                  activeEditorRef.current = e.currentTarget;
-                                  rememberSelection();
-                                }}
-                                onMouseUp={rememberSelection}
-                                onKeyUp={rememberSelection}
-                                onBlur={(e) =>
-                                  updateClauseHtml(
-                                    clause.id,
-                                    e.currentTarget.innerHTML,
-                                  )
-                                }
-                                dangerouslySetInnerHTML={{
-                                  __html: clauseHtml(clause),
-                                }}
-                              />
-                              <div className="clause-actions">
-                                <button onClick={() => toggleClause(clause.id)}>
-                                  <X size={12} />
-                                  Exclude
-                                </button>
-                                <button
-                                  onClick={() =>
-                                    duplicateClause(section.id, clause)
-                                  }
-                                >
-                                  <Copy size={12} />
-                                  Duplicate
-                                </button>
-                                <button
-                                  onClick={() => addClause(section.id, true)}
-                                >
-                                  <Plus size={12} />
-                                  Insert below
-                                </button>
-                              </div>
-                            </div>
-                          </div>
-                        ) : clause.included ? null : (
-                          <div
-                            className="excluded-clause"
-                            key={clause.id}
-                            onClick={() => toggleClause(clause.id)}
-                          >
-                            <Archive size={13} />
-                            {clause.title} excluded · click to restore
-                          </div>
-                        ),
-                      )}
-                    </section>
-                  ))}
-                  <button className="inline-add" onClick={addSection}>
-                    <Plus size={14} />
-                    Add a section
-                  </button>
-                </div>
-                <div className="signatures">
-                  <div>
-                    <div className="sign-line" />
-                    <strong>{values.signatory_name}</strong>
-                    <span>{values.signatory_title}</span>
-                    <small>Date: __________________</small>
-                  </div>
-                  <div>
-                    <div className="sign-line" />
-                    <strong>{values.full_name}</strong>
-                    <span>Employee</span>
-                    <small>Date: __________________</small>
-                  </div>
-                </div>
-                <div className="page-footer">
-                  <span>Northstar Labs · Confidential</span>
-                  <span>Page 1 of {estimatePageCount()}</span>
+                  )}
                 </div>
               </div>
             </div>
           </div>
         </main>
         <aside className="right-panel">
-          <div className="right-tabs">
-            <button
-              className={activeRightTab === "person" ? "active" : ""}
-              onClick={() => setActiveRightTab("person")}
-            >
-              <UserRound size={15} />
-              Source
-            </button>
-            <button
-              className={activeRightTab === "placeholders" ? "active" : ""}
-              onClick={() => setActiveRightTab("placeholders")}
-            >
-              <Sparkles size={15} />
-              Fields
-            </button>
-            <button
-              className={activeRightTab === "clauses" ? "active" : ""}
-              onClick={() => setActiveRightTab("clauses")}
-            >
-              <Archive size={15} />
-              Clauses
-            </button>
-            <button
-              className={activeRightTab === "letterhead" ? "active" : ""}
-              onClick={() => setActiveRightTab("letterhead")}
-            >
-              <PanelRight size={15} />
-              Layout
-            </button>
-          </div>
+          {renderWorkspaceToolSwitcher()}
           {activeRightTab === "person" && (
             <div className="panel-content">
               <div className="panel-title-row">
@@ -3824,36 +5229,128 @@ function App() {
                 <Plus size={14} />
                 Create placeholder
               </button>
-              <button className="text-btn" onClick={() => switchModule("placeholders")}>Open Placeholder Management <ChevronRight size={13} /></button>
+              <button
+                className="text-btn workspace-library-toggle"
+                onClick={() => {
+                  setWorkspaceLibrarySearch("");
+                  setWorkspaceLibraryOpen((current) => current === "placeholders" ? null : "placeholders");
+                }}
+              >
+                <Sparkles size={13} />
+                {workspaceLibraryOpen === "placeholders" ? "Hide data groups" : "Browse data groups"}
+                <ChevronRight size={13} />
+              </button>
+              {workspaceLibraryOpen === "placeholders" && (
+                <div className="workspace-library-browser">
+                  <div className="workspace-library-heading">
+                    <div><span>CONNECTED DATA</span><strong>Placeholder groups</strong></div>
+                    <button className="icon-btn" title="Create group" onClick={() => openPlaceholderEditor()}><Plus size={13} /></button>
+                  </div>
+                  <label className="workspace-library-search">
+                    <Search size={13} />
+                    <input value={workspaceLibrarySearch} onChange={(event) => setWorkspaceLibrarySearch(event.target.value)} placeholder="Search groups or fields" />
+                  </label>
+                  <div className="workspace-library-list">
+                    {workspacePlaceholderGroups.map((group) => (
+                      <div className="workspace-library-card" key={group.id}>
+                        <div className="workspace-library-card-head">
+                          <span><strong>{group.name}</strong><small>{group.sourceType} · {group.fields.length} fields</small></span>
+                          <button className="icon-btn" title={`Edit ${group.name}`} onClick={() => openPlaceholderEditor(group)}><Settings2 size={13} /></button>
+                        </div>
+                        <div className="workspace-field-chips">
+                          {group.fields.slice(0, 5).map((field) => (
+                            <span className={field.mappingStatus === "valid" ? "" : "invalid"} key={field.id}>{field.label}</span>
+                          ))}
+                          {group.fields.length > 5 && <span>+{group.fields.length - 5}</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <button className="workspace-full-management" onClick={() => switchModule("placeholders")}>Open full management <ChevronRight size={12} /></button>
+                </div>
+              )}
             </div>
           )}
           {activeRightTab === "clauses" && (
             <div className="panel-content">
-              <div className="panel-title-row">
+              <div className="panel-title-row clause-panel-title-row">
                 <div>
-                  <span className="eyebrow">LIBRARY</span>
-                  <h3>Clause selection</h3>
+                  <span className="eyebrow">CONTENT MAP</span>
+                  <h3>Clauses & sections</h3>
+                  <p className="panel-subtitle">Select a section on the left, then include or exclude its paragraphs here.</p>
                 </div>
-                <div className="row-actions"><button className="mini-icon" title="Add custom clause" onClick={() => addClause(activeSection)}><Plus size={15} /></button><button className="mini-icon" title="Open Clauses Library" onClick={() => switchModule("clauses")}><FolderOpen size={14} /></button></div>
+                <div className="row-actions"><button className="mini-icon" title="Add custom clause" onClick={activeSection ? () => addClause(activeSection) : addParagraphElement}><Plus size={15} /></button><button className="mini-icon" title="Browse Clauses Library here" onClick={() => { setWorkspaceLibrarySearch(""); setWorkspaceLibraryOpen((current) => current === "clauses" ? null : "clauses"); }}><FolderOpen size={14} /></button></div>
               </div>
-              <button className="add-field" onClick={() => switchModule("clauses")}><Archive size={14} /> Add from Clauses Library</button>
-              <div className="helper-callout amber">
+              <div className="clause-panel-toolbar">
+                <div className="clause-focus-copy">
+                  <span>Editing</span>
+                  <strong>{orderedSections.find((section) => section.id === activeSection)?.title || "No section selected"}</strong>
+                </div>
+                <div className="segmented-control clause-scope-toggle" aria-label="Clause scope">
+                  <button className={clauseScope === "current" ? "active" : ""} aria-pressed={clauseScope === "current"} disabled={!activeSection} onClick={() => setClauseScope("current")}>Current</button>
+                  <button className={clauseScope === "all" ? "active" : ""} aria-pressed={clauseScope === "all"} onClick={() => setClauseScope("all")}>All</button>
+                </div>
+              </div>
+              <div className="clause-panel-actions">
+                <button className="add-field" onClick={() => { setWorkspaceLibrarySearch(""); setWorkspaceLibraryOpen((current) => current === "clauses" ? null : "clauses"); }}><Archive size={14} /> {workspaceLibraryOpen === "clauses" ? "Hide Clauses Library" : "Add from Clauses Library"}</button>
+                <button className="text-btn" onClick={activeSection ? () => addClause(activeSection, true) : addParagraphElement}><Plus size={13} /> Write custom paragraph</button>
+              </div>
+              {workspaceLibraryOpen === "clauses" && (
+                <div className="workspace-library-browser clause-browser">
+                  <div className="workspace-library-heading">
+                    <div><span>REUSABLE CONTENT</span><strong>Clauses Library</strong></div>
+                    <button className="icon-btn" title="Create reusable clause" onClick={() => openClauseEditor()}><Plus size={13} /></button>
+                  </div>
+                  <label className="workspace-library-search">
+                    <Search size={13} />
+                    <input value={workspaceLibrarySearch} onChange={(event) => setWorkspaceLibrarySearch(event.target.value)} placeholder="Search clauses" />
+                  </label>
+                  <div className="workspace-library-list">
+                    {workspaceClauseRecords.length ? workspaceClauseRecords.map((record) => {
+                      const selected = workspaceClausePreviewId === record.id;
+                      const sourceClauses = record.structure === "nested" ? record.subsections.flatMap((subsection) => subsection.contents) : record.contents;
+                      return (
+                        <div className={`workspace-library-card ${selected ? "selected" : ""}`} key={record.id}>
+                          <button className="workspace-library-card-button" onClick={() => setWorkspaceClausePreviewId(selected ? null : record.id)}>
+                            <span><strong>{record.title}</strong><small>{record.category} · v{record.version} · {sourceClauses.length} blocks</small></span>
+                            <ChevronRight size={13} />
+                          </button>
+                          {selected && (
+                            <div className="workspace-clause-preview">
+                              <p>{sourceClauses[0]?.text || "No content blocks"}</p>
+                              <button className="primary-btn" disabled={!sourceClauses.length} onClick={() => insertClauseRecord(record)}><Plus size={13} /> Insert copy</button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    }) : <div className="workspace-library-empty">No matching clauses.</div>}
+                  </div>
+                  <button className="workspace-full-management" onClick={() => switchModule("clauses")}>Open full management <ChevronRight size={12} /></button>
+                </div>
+              )}
+              <div className="helper-callout amber compact-callout">
                 <CircleHelp size={15} />
-                <span>
-                  Excluded clauses remain in the draft and can be restored.
-                </span>
+                <span>Excluded paragraphs stay in the draft and can be restored.</span>
               </div>
-              {sections.map((section) => (
-                <div className="clause-group" key={section.id}>
-                  <div className="group-title">
-                    <span>{section.title}</span>
+              {clausePanelSections.length ? clausePanelSections.map((section) => {
+                const sectionNumber = orderedSections.findIndex((item) => item.id === section.id) + 1;
+                return (
+                <div className={`clause-group ${activeSection === section.id ? "active" : ""}`} key={section.id}>
+                  <button className="group-title group-title-button" onClick={() => focusSection(section.id)}>
+                    <span><b>{String(sectionNumber).padStart(2, "0")}</b>{section.title}</span>
                     <small>
                       {section.clauses.filter((c) => c.included).length}/
                       {section.clauses.length}
+                      <ChevronRight size={13} />
                     </small>
-                  </div>
+                  </button>
                   {section.clauses.map((clause) => (
-                    <label className="clause-toggle" key={clause.id}>
+                    <label className={`clause-toggle ${activeClause === clause.id ? "selected" : ""}`} key={clause.id} onClick={() => {
+                      setActiveSection(section.id);
+                      setActiveClause(clause.id);
+                      const block = canvasBlocks.find((item) => item.kind === "section" && item.sectionId === section.id);
+                      if (block) setActiveCanvasBlock(block.id);
+                    }}>
                       <input
                         type="checkbox"
                         checked={clause.included}
@@ -3870,14 +5367,8 @@ function App() {
                     </label>
                   ))}
                 </div>
-              ))}
-              <button
-                className="add-field"
-                onClick={() => addClause(activeSection, true)}
-              >
-                <Plus size={14} />
-                Write custom paragraph
-              </button>
+                );
+              }) : <div className="clauses-empty-state"><Archive size={18} /><strong>No sections yet</strong><span>Add a section to start building the document content.</span><button className="add-field" onClick={addSection}><Plus size={14} /> Add section</button></div>}
             </div>
           )}
           {activeRightTab === "letterhead" && (
@@ -4018,6 +5509,95 @@ function App() {
                   </small>
                 </div>
               </div>
+              <div className="watermark-settings">
+                <div className="watermark-settings-heading">
+                  <span className="watermark-settings-icon"><ShieldCheck size={15} /></span>
+                  <div>
+                    <strong>Verification watermark</strong>
+                    <small>Required on every page and included in Word and PDF.</small>
+                  </div>
+                </div>
+                <div className="drawer-grid watermark-grid">
+                  <label className="drawer-field">
+                    <span>Placement</span>
+                    <select
+                      value={watermark.placement}
+                      disabled={!canEditDocument}
+                      onChange={(event) => updateWatermark({ placement: event.target.value as VerificationWatermark["placement"] })}
+                    >
+                      <option value="header">Header</option>
+                      <option value="footer">Footer</option>
+                    </select>
+                  </label>
+                  <label className="drawer-field">
+                    <span>Alignment</span>
+                    <div className="watermark-alignment" role="group" aria-label="Watermark alignment">
+                      {([
+                        ["left", AlignLeft],
+                        ["center", AlignCenter],
+                        ["right", AlignRight],
+                      ] as const).map(([alignment, Icon]) => (
+                        <button
+                          key={alignment}
+                          type="button"
+                          className={watermark.alignment === alignment ? "active" : ""}
+                          disabled={!canEditDocument}
+                          title={`${alignment[0].toUpperCase()}${alignment.slice(1)} align`}
+                          aria-label={`${alignment} align watermark`}
+                          onClick={() => updateWatermark({ alignment })}
+                        >
+                          <Icon size={14} />
+                        </button>
+                      ))}
+                    </div>
+                  </label>
+                </div>
+                <label className="drawer-field">
+                  <span>Anti-counterfeit text</span>
+                  <input
+                    value={watermark.text}
+                    disabled={!canEditDocument}
+                    required
+                    placeholder="VERIFIED DOCUMENT"
+                    onChange={(event) => updateWatermark({ text: event.target.value })}
+                  />
+                </label>
+                <label className="drawer-field">
+                  <span>Timestamp format</span>
+                  <input
+                    value={watermark.timestampFormat}
+                    disabled={!canEditDocument}
+                    required
+                    list="watermark-timestamp-formats"
+                    placeholder="YYYY-MM-DD HH:mm:ss Z"
+                    onChange={(event) => updateWatermark({ timestampFormat: event.target.value })}
+                  />
+                  <small>Tokens: YYYY, YY, MMM, MM, DD, HH, hh, mm, ss, A, Z</small>
+                </label>
+                <datalist id="watermark-timestamp-formats">
+                  <option value="YYYY-MM-DD HH:mm:ss Z" />
+                  <option value="DD/MM/YYYY HH:mm" />
+                  <option value="MMM DD, YYYY hh:mm A" />
+                </datalist>
+                <div className={`watermark-live-preview watermark-live-preview-${watermark.placement}`}>
+                  <span style={{ textAlign: watermark.alignment }}>{watermarkDisplayText(watermark)}</span>
+                </div>
+                <div className="watermark-code-row">
+                  <span>Verification code</span>
+                  <code>{watermark.verificationId}</code>
+                  <button
+                    className="icon-btn"
+                    type="button"
+                    disabled={!canEditDocument}
+                    title="Generate a new verification code"
+                    aria-label="Generate a new verification code"
+                    onClick={() => updateWatermark({ verificationId: makeVerificationId() })}
+                  >
+                    <RefreshCw size={13} />
+                  </button>
+                </div>
+                <p className="watermark-note">The displayed timestamp is captured when each file is exported.</p>
+              </div>
               <div className="button-stack">
                 <button className="add-field" disabled={currentRole !== "Admin" || !canEditDocument} onClick={() => {
                   if (currentRole !== "Admin") {
@@ -4034,7 +5614,120 @@ function App() {
                   Publish template layout v{(templateVersions[templateId] || 0) + 1}
                 </button>
               <button className="text-btn" onClick={() => { setModuleNotice("Current document keeps this layout independently"); }}><Check size={13} /> Save only to current document</button>
-              <button className="text-btn" onClick={() => switchModule("layouts")}>Open Layout Management <ChevronRight size={13} /></button>
+              <button
+                className="text-btn workspace-library-toggle"
+                onClick={() => {
+                  setWorkspaceLibrarySearch("");
+                  setWorkspaceLibraryOpen((current) => current === "layouts" ? null : "layouts");
+                }}
+              >
+                <PanelRight size={13} />
+                {workspaceLibraryOpen === "layouts" ? "Hide saved layouts" : "Browse saved layouts"}
+                <ChevronRight size={13} />
+              </button>
+              </div>
+              {workspaceLibraryOpen === "layouts" && (
+                <div className="workspace-library-browser layout-browser">
+                  <div className="workspace-library-heading">
+                    <div><span>LAYOUT LIBRARY</span><strong>Saved page designs</strong></div>
+                    <button className="icon-btn" title="Create layout" onClick={() => openLayoutEditor()}><Plus size={13} /></button>
+                  </div>
+                  <label className="workspace-library-search">
+                    <Search size={13} />
+                    <input value={workspaceLibrarySearch} onChange={(event) => setWorkspaceLibrarySearch(event.target.value)} placeholder="Search layouts" />
+                  </label>
+                  <div className="workspace-library-list">
+                    {workspaceLayoutRecords.map((record) => (
+                      <div className="workspace-library-card workspace-layout-option" key={record.id}>
+                        <div className="workspace-layout-swatch" style={{ borderTopColor: (record.letterhead.firstPage || record.letterhead).accent }} />
+                        <span><strong>{record.name}</strong><small>{record.letterhead.page} · {record.status}</small></span>
+                        <button className="outline-btn" onClick={() => applyLayoutRecord(record)}>Apply</button>
+                        <button className="icon-btn" title={`Edit ${record.name}`} onClick={() => openLayoutEditor(record)}><Settings2 size={13} /></button>
+                      </div>
+                    ))}
+                  </div>
+                  <button className="workspace-full-management" onClick={() => switchModule("layouts")}>Open full management <ChevronRight size={12} /></button>
+                </div>
+              )}
+            </div>
+          )}
+          {activeRightTab === "review" && (
+            <div className="panel-content workspace-review-panel">
+              <div className="panel-title-row">
+                <div>
+                  <span className="eyebrow">SELF REVIEW</span>
+                  <h3>Document checks</h3>
+                  <p className="panel-subtitle">Review source data, content and page output while keeping the document visible.</p>
+                </div>
+                <span className={`review-count ${blockingIssues.length ? "has-issues" : "ready"}`}>{blockingIssues.length}</span>
+              </div>
+              <div className={`review-summary ${blockingIssues.length ? "warning" : "ready"}`}>
+                {blockingIssues.length ? <AlertTriangle size={16} /> : <ShieldCheck size={16} />}
+                <span>
+                  <strong>{blockingIssues.length ? `${blockingIssues.length} issue${blockingIssues.length === 1 ? "" : "s"} need attention` : "Ready for final preview"}</strong>
+                  <small>{blockingIssues.length ? "Open a check below to fix it without leaving Workspace." : "All automated checks currently pass."}</small>
+                </span>
+              </div>
+              <div className="workspace-review-list">
+                {([
+                  {
+                    id: "source",
+                    label: "Onboarding source",
+                    detail: connectionStatus === "Failed" ? "Connection needs attention" : hasUnreviewedSync ? `${syncDiffs.length} source update${syncDiffs.length === 1 ? "" : "s"} waiting` : `${person.name} · ${person.submissionId}`,
+                    issue: connectionStatus === "Failed" || hasUnreviewedSync,
+                    tab: "person",
+                    Icon: UserRound,
+                  },
+                  {
+                    id: "fields",
+                    label: "Required fields",
+                    detail: blockingIssues.find((issue) => issue.startsWith("Missing") || issue.startsWith("Unresolved")) || "All active values resolved",
+                    issue: blockingIssues.some((issue) => issue.startsWith("Missing") || issue.startsWith("Unresolved")),
+                    tab: "placeholders",
+                    Icon: Sparkles,
+                  },
+                  {
+                    id: "clauses",
+                    label: "Clauses and identity",
+                    detail: blockingIssues.find((issue) => issue.includes("another person's") || issue.includes("billing")) || `${sections.flatMap((section) => section.clauses).filter((clause) => clause.included).length} included paragraphs`,
+                    issue: blockingIssues.some((issue) => issue.includes("another person's") || issue.includes("billing")),
+                    tab: "clauses",
+                    Icon: Archive,
+                  },
+                  {
+                    id: "layout",
+                    label: "Layout and Letterhead",
+                    detail: blockingIssues.find((issue) => issue.includes("overlaps")) || `${letterhead.page} · ${letterhead.mode === "different" ? "different page styles" : letterhead.mode === "all" ? "every page" : "first page"}`,
+                    issue: blockingIssues.some((issue) => issue.includes("overlaps")),
+                    tab: "letterhead",
+                    Icon: PanelRight,
+                  },
+                  {
+                    id: "verification",
+                    label: "Verification watermark",
+                    detail: blockingIssues.find((issue) => issue.includes("Verification")) || `${watermark.placement} · ${watermark.alignment} · ${watermark.verificationId}`,
+                    issue: blockingIssues.some((issue) => issue.includes("Verification")),
+                    tab: "letterhead",
+                    Icon: ShieldCheck,
+                  },
+                ] as const).map(({ id, label, detail, issue, tab, Icon }) => (
+                  <button className={`workspace-review-row ${issue ? "issue" : "ok"}`} key={id} onClick={() => openWorkspaceTool(tab)}>
+                    <span className="workspace-review-icon"><Icon size={14} /></span>
+                    <span><strong>{label}</strong><small>{detail}</small></span>
+                    {issue ? <AlertTriangle size={14} /> : <Check size={14} />}
+                    <ChevronRight size={13} />
+                  </button>
+                ))}
+              </div>
+              {blockingIssues.length > 0 && (
+                <div className="workspace-review-issues" role="alert">
+                  <strong>Issues found</strong>
+                  {blockingIssues.map((issue) => <span key={issue}>{issue}</span>)}
+                </div>
+              )}
+              <div className="workspace-review-actions">
+                <button className="primary-btn" onClick={() => setShowPreview(true)}><FileCheck2 size={14} /> Preview final document</button>
+                <button className="outline-btn" onClick={() => openWorkspaceTool("outline")}><PanelLeftOpen size={14} /> Back to outline</button>
               </div>
             </div>
           )}
@@ -4134,25 +5827,34 @@ function App() {
               </div>
             )}
             <div className="preview-sheet">
-              <div className="preview-sheet-head">
-                <span>{template.type}</span>
-                  <span>Page 1 of {estimatePageCount()}</span>
+              <div
+                className={`verification-watermark verification-watermark-${watermark.placement} verification-watermark-${watermark.alignment}`}
+                aria-label="Document verification watermark"
+              >
+                {watermarkDisplayText(watermark)}
               </div>
-              <h1>{template.type}</h1>
-              <p>
-                Between {values.company_name} and {values.full_name}
-              </p>
-              {sections.map((section) => (
-                <div className="preview-section" key={section.id}>
-                  <h3>{section.title}</h3>
-                  {section.clauses.filter(shouldShowClause).map((c) => (
-                    <p
-                      key={c.id}
-                      dangerouslySetInnerHTML={{ __html: clauseHtml(c) }}
-                    />
-                  ))}
-                </div>
-              ))}
+              {canvasBlocks.length ? canvasBlocks.map((block) => {
+                if (block.kind === "letterhead") {
+                  const layout = letterhead.firstPage || letterhead;
+                  return <div className="preview-letterhead" key={block.id} style={{ borderColor: layout.accent }}>
+                    {layout.dataUrl ? <img src={layout.dataUrl} alt="Letterhead" /> : <><strong>{values.company_name || "Company"}</strong><span>People & Culture</span></>}
+                  </div>;
+                }
+                if (block.kind === "meta") return <div className="preview-sheet-head" key={block.id}><span>{template.type}</span><span>Page 1 of {estimatePageCount()}</span></div>;
+                if (block.kind === "title") return <h1 key={block.id}>{docName}</h1>;
+                if (block.kind === "lede") return <p key={block.id}>Between {values.company_name || "Company"} and {values.full_name || "Recipient"}</p>;
+                if (block.kind === "section" && block.sectionId) {
+                  const section = sections.find((item) => item.id === block.sectionId);
+                  if (!section) return null;
+                  return <div className="preview-section" key={block.id}>
+                    <h3>{section.title}</h3>
+                    {section.clauses.filter(shouldShowClause).map((c) => <p key={c.id} dangerouslySetInnerHTML={{ __html: clauseHtml(c) }} />)}
+                  </div>;
+                }
+                if (block.kind === "signatures") return <div className="preview-signatures" key={block.id}><span>Company representative: {values.signatory_name || "________________"}</span><span>Employee / Contractor: {values.full_name || "________________"}</span></div>;
+                if (block.kind === "footer") return <div className="preview-sheet-footer" key={block.id}><span>{values.company_name || "Company"} · Confidential</span><span>Page 1 of {estimatePageCount()}</span></div>;
+                return null;
+              }) : <div className="preview-empty-state"><FileText size={20} /><span>Blank canvas</span></div>}
             </div>
             <div className="modal-footer">
               <button className="outline-btn" onClick={makeDocx} disabled={blockingIssues.length > 0 || exportState === "exporting"}>
