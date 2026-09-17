@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import postgres from "postgres";
-import { requirePlatformConfiguration } from "./config.js";
+import { requireDatabaseConfiguration } from "./config.js";
 
 export type EmailConnectionRow = {
   id: string;
@@ -28,7 +28,7 @@ let client: ReturnType<typeof postgres> | null = null;
 let schemaPromise: Promise<unknown> | null = null;
 
 export const database = () => {
-  requirePlatformConfiguration();
+  requireDatabaseConfiguration();
   if (!client) client = postgres(process.env.DATABASE_URL as string, { max: 4, idle_timeout: 20 });
   if (!schemaPromise) {
     schemaPromise = client`

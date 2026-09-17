@@ -5,6 +5,7 @@ import { encryptCredential } from "../_lib/crypto.js";
 import { publicConnection } from "../_lib/connection.js";
 import { upsertEmailConnection } from "../_lib/database.js";
 import { ApiError, handleApiError, json, parseBody, requireMethod } from "../_lib/http.js";
+import { requireWorkspaceAccess } from "../_lib/workspace-store.js";
 
 type Input = {
   gmailAddress?: string;
@@ -24,7 +25,8 @@ export default async function handler(request: VercelRequest, response: VercelRe
   try {
     requireMethod(request, ["POST"]);
     const session = requireSession(request);
-    if (session.role === "Reviewer") throw new ApiError(403, "FORBIDDEN", "Reviewers cannot manage email connections.");
+    const role = await requireWorkspaceAccess(session);
+    if (role === "Reviewer") throw new ApiError(403, "FORBIDDEN", "Reviewers cannot manage email connections.");
     const input = parseBody<Input>(request);
     const gmailAddress = String(input.gmailAddress || "").trim().toLowerCase();
     const appPassword = String(input.gmailAppPassword || "").replace(/\s+/g, "");

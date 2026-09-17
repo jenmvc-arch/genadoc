@@ -5,6 +5,7 @@ import { requireGoogleConfiguration } from "../_lib/config.js";
 import { decryptCredential } from "../_lib/crypto.js";
 import { findEmailConnection, recordConnectionTest } from "../_lib/database.js";
 import { ApiError, handleApiError, json, parseBody, requireMethod } from "../_lib/http.js";
+import { requireWorkspaceAccess } from "../_lib/workspace-store.js";
 
 type OAuthCredential = { refreshToken: string };
 type AppPasswordCredential = { appPassword: string };
@@ -46,6 +47,8 @@ export default async function handler(request: VercelRequest, response: VercelRe
   try {
     requireMethod(request, ["POST"]);
     const session = requireSession(request);
+    const role = await requireWorkspaceAccess(session);
+    if (role === "Reviewer") throw new ApiError(403, "FORBIDDEN", "Reviewers cannot send email connection tests.");
     const connection = await findEmailConnection(session.userId, session.workspaceId);
     if (!connection || connection.status === "disconnected") {
       throw new ApiError(404, "CONNECTION_NOT_FOUND", "Connect an email account before sending a test.");

@@ -1,4 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
   AlignmentType,
@@ -88,6 +95,15 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
+const EDITOR_FONT_SIZES = [
+  8, 9, 10, 11, 12, 13, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72,
+];
+
+const normalizeEditorFontSize = (value: string | number | undefined) => {
+  const parsed = typeof value === "number" ? value : Number.parseFloat(value || "");
+  return Math.min(72, Math.max(8, Number.isFinite(parsed) ? Math.round(parsed) : 11));
+};
+
 type DocumentType =
   "Offer Letter" | "Fixed-Term Employment Agreement" | "Freelance Agreement";
 type Clause = {
@@ -144,10 +160,11 @@ type Letterhead = {
   fileName?: string;
   fileType?: string;
   dataUrl?: string;
+  storagePath?: string;
   firstPage?: LetterheadLayout;
   subsequentPage?: LetterheadLayout;
 };
-type LetterheadLayout = Pick<Letterhead, "accent" | "opacity" | "top" | "left" | "width" | "margin" | "fileName" | "fileType" | "dataUrl">;
+type LetterheadLayout = Pick<Letterhead, "accent" | "opacity" | "top" | "left" | "width" | "margin" | "fileName" | "fileType" | "dataUrl" | "storagePath">;
 type VerificationWatermark = {
   placement: "header" | "footer";
   alignment: "left" | "center" | "right";
@@ -163,6 +180,10 @@ type CustomPlaceholder = {
 };
 type UserRole = "Admin" | "Editor" | "Reviewer";
 type AuthSession = {
+  userId?: string;
+  workspaceId?: string;
+  workspaceName?: string;
+  role?: UserRole;
   displayName: string;
   email: string;
   signedInAt: string;
@@ -294,6 +315,8 @@ type ExportRecord = {
   fileName: string;
   createdAt: string;
   contentBase64?: string;
+  storagePath?: string;
+  byteSize?: number;
   error?: string;
 };
 type DocumentRecord = {
@@ -326,6 +349,51 @@ type AppStore = {
   layouts: LayoutRecord[];
   documents: DocumentRecord[];
   exports: ExportRecord[];
+};
+type WorkspacePersistedState = {
+  templates: Template[];
+  templateId: string;
+  personId: string;
+  values: Record<string, string>;
+  letterhead: Letterhead;
+  watermark: VerificationWatermark;
+  sections: Section[];
+  canvasBlocks: CanvasBlock[];
+  docName: string;
+  docStatus: "Draft" | "In review" | "Approved";
+  workflowStage: WorkflowStage;
+  customPlaceholders: CustomPlaceholder[];
+  currentRole: UserRole;
+  connectionStatus: "Connected" | "Syncing" | "Failed";
+  connectionError: string;
+  lastSyncAt: string;
+  lastSavedAt: string;
+  sourceSnapshots: Record<string, Record<string, string>>;
+  sourceUpdates: Record<string, Record<string, string>>;
+  sourceUpdateMeta: Record<string, { submissionId: string; detectedAt: string }>;
+  manualOverrides: string[];
+  versions: DocumentVersion[];
+  templateVersions: Record<string, number>;
+  templateLayouts: Record<string, Letterhead>;
+  versionCounter: number;
+};
+type CloudWorkspacePayload = {
+  schemaVersion: 2;
+  appStore: AppStore;
+  workspace: WorkspacePersistedState;
+  preferences: {
+    theme: "light" | "dark";
+    navigation: NavigationState;
+    editor: { zoom: number; fontSize: number };
+    notifications: Record<string, unknown>;
+  };
+};
+type CloudWorkspaceState = {
+  schemaVersion: number;
+  revision: number;
+  payload: CloudWorkspacePayload;
+  updatedAt: string;
+  updatedBy: string;
 };
 
 const formatDocumentStamp = (date = new Date()) => {
@@ -798,6 +866,23 @@ const dataUrlToBytes = (dataUrl?: string) => {
     return null;
   }
 };
+const assetFileUrl = (storagePath: string, download = false) =>
+  `/api/assets/file?path=${encodeURIComponent(storagePath)}${download ? "&download=1" : ""}`;
+const sourceToBytes = async (source?: string) => {
+  const local = dataUrlToBytes(source);
+  if (local) return local;
+  if (!source) return null;
+  const response = await fetch(source);
+  if (!response.ok) throw new Error("The private Letterhead image could not be downloaded.");
+  return new Uint8Array(await response.arrayBuffer());
+};
+const sourceToDataUrl = async (source?: string) => {
+  if (!source) return undefined;
+  if (source.startsWith("data:")) return source;
+  const response = await fetch(source);
+  if (!response.ok) throw new Error("The private Letterhead image could not be downloaded.");
+  return blobToDataUrl(await response.blob());
+};
 const blobToDataUrl = (blob: Blob) => new Promise<string>((resolve, reject) => {
   const reader = new FileReader();
   reader.onload = () => resolve(String(reader.result || ""));
@@ -952,6 +1037,118 @@ const readAppStore = (): AppStore => {
   }
 };
 
+class CloudStateError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public code?: string,
+    public details?: unknown,
+  ) {
+    super(message);
+  }
+}
+
+const readCloudResponse = async <T,>(response: Response): Promise<T> => {
+  const result = await response.json().catch(() => ({
+    ok: false,
+    code: "BACKEND_NOT_CONFIGURED",
+    error: "The cloud API returned an invalid response.",
+  })) as T & { ok?: boolean; code?: string; error?: string; details?: unknown };
+  if (!response.ok || result.ok === false) {
+    throw new CloudStateError(result.error || "The cloud request failed.", response.status, result.code, result.details);
+  }
+  return result;
+};
+
+const loadCloudWorkspace = async () => {
+  const response = await fetch("/api/workspace-state", { headers: { Accept: "application/json" } });
+  return readCloudResponse<{
+    ok: true;
+    state: CloudWorkspaceState | null;
+    preferences?: { theme?: "light" | "dark"; navigation?: NavigationState } | null;
+    role: UserRole;
+  }>(response);
+};
+
+const saveCloudWorkspace = async (payload: CloudWorkspacePayload, baseRevision: number | null) => {
+  const response = await fetch("/api/workspace-state", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ payload, baseRevision }),
+  });
+  return readCloudResponse<{
+    ok: true;
+    state: { schemaVersion: number; revision: number; updatedAt: string; updatedBy: string };
+  }>(response);
+};
+
+const uploadPrivateAsset = async (
+  file: Blob,
+  fileName: string,
+  kind: "letterhead" | "export" | "document-image",
+) => {
+  const preparedResponse = await fetch("/api/assets/upload-url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ fileName, contentType: file.type || "application/octet-stream", byteSize: file.size, kind }),
+  });
+  const prepared = await readCloudResponse<{
+    ok: true;
+    asset: { id: string; storagePath: string; signedUrl: string };
+  }>(preparedResponse);
+  const form = new FormData();
+  form.append("cacheControl", "3600");
+  form.append("", file, fileName);
+  const uploadResponse = await fetch(prepared.asset.signedUrl, {
+    method: "PUT",
+    headers: { "x-upsert": "false" },
+    body: form,
+  });
+  if (!uploadResponse.ok) throw new Error("Supabase Storage rejected the file upload.");
+  const completeResponse = await fetch("/api/assets/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ assetId: prepared.asset.id, storagePath: prepared.asset.storagePath }),
+  });
+  await readCloudResponse<{ ok: true }>(completeResponse);
+  return prepared.asset;
+};
+
+const moveEmbeddedAssetsToStorage = async (payload: CloudWorkspacePayload) => {
+  const migrated = clone(payload) as CloudWorkspacePayload;
+  const uploaded = new Map<string, { storagePath: string; byteSize: number }>();
+  const walk = async (value: unknown): Promise<void> => {
+    if (!value || typeof value !== "object") return;
+    const record = value as Record<string, unknown>;
+    const dataUrl = typeof record.dataUrl === "string" && record.dataUrl.startsWith("data:") ? record.dataUrl : "";
+    const contentBase64 = typeof record.contentBase64 === "string" && record.contentBase64.startsWith("data:") ? record.contentBase64 : "";
+    const embedded = dataUrl || contentBase64;
+    if (embedded) {
+      let stored = uploaded.get(embedded);
+      if (!stored) {
+        const blob = await (await fetch(embedded)).blob();
+        const fileName = String(record.fileName || (contentBase64 ? `migrated-export.${record.format === "pdf" ? "pdf" : "docx"}` : "migrated-letterhead.png"));
+        const asset = await uploadPrivateAsset(blob, fileName, contentBase64 ? "export" : "letterhead");
+        stored = { storagePath: asset.storagePath, byteSize: blob.size };
+        uploaded.set(embedded, stored);
+      }
+      record.storagePath = stored.storagePath;
+      record.byteSize = record.byteSize || stored.byteSize;
+      if (dataUrl) record.dataUrl = assetFileUrl(stored.storagePath);
+      if (contentBase64) delete record.contentBase64;
+    }
+    for (const child of Object.values(record)) {
+      if (Array.isArray(child)) {
+        for (const item of child) await walk(item);
+      } else if (child && typeof child === "object") {
+        await walk(child);
+      }
+    }
+  };
+  await walk(migrated);
+  return migrated;
+};
+
 function LoginScreen({
   theme,
   onThemeChange,
@@ -959,30 +1156,27 @@ function LoginScreen({
 }: {
   theme: "light" | "dark";
   onThemeChange: () => void;
-  onLogin: (session: AuthSession, remember: boolean) => void;
+  onLogin: (email: string, password: string, remember: boolean) => Promise<void>;
 }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [remember, setRemember] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [loginError, setLoginError] = useState("");
 
-  const submitLogin = (event: React.FormEvent<HTMLFormElement>) => {
+  const submitLogin = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (submitting) return;
     setSubmitting(true);
-    const normalizedEmail = email.trim();
-    const label = normalizedEmail
-      ? normalizedEmail.split("@")[0].replace(/[._-]+/g, " ").trim()
-      : "Demo HR user";
-    window.setTimeout(() => {
+    setLoginError("");
+    try {
+      await onLogin(email.trim(), password, remember);
+    } catch (error) {
+      setLoginError(error instanceof Error ? error.message : "Sign in failed. Check your account and try again.");
+    } finally {
       setSubmitting(false);
-      onLogin({
-        displayName: label || "Demo HR user",
-        email: normalizedEmail,
-        signedInAt: new Date().toISOString(),
-      }, remember);
-    }, 320);
+    }
   };
 
   return (
@@ -1033,11 +1227,11 @@ function LoginScreen({
           <div className="login-form-heading">
             <span>Welcome back</span>
             <h2>Sign in to your workspace</h2>
-            <p>Use your work account, or continue with the blank demo access.</p>
+            <p>Use your Supabase workspace account. Blank demo access is available only when enabled by an administrator.</p>
           </div>
 
           <label className="login-field">
-            <span>Work email <small>Optional</small></span>
+            <span>Work email</span>
             <input
               type="email"
               value={email}
@@ -1049,7 +1243,7 @@ function LoginScreen({
           </label>
 
           <label className="login-field">
-            <span>Password <small>Optional</small></span>
+            <span>Password</span>
             <span className="login-password-field">
               <input
                 type={showPassword ? "text" : "password"}
@@ -1079,9 +1273,11 @@ function LoginScreen({
             {submitting ? "Signing in..." : "Sign in"}
           </button>
 
+          {loginError && <div className="login-error" role="alert"><AlertTriangle size={16} /><span>{loginError}</span></div>}
+
           <div className="login-demo-note" aria-live="polite">
             <ShieldCheck size={17} />
-            <span><strong>Blank access is enabled</strong><small>Leave both fields empty and select Sign in. Passwords are not stored in this browser demo.</small></span>
+            <span><strong>Controlled demo access</strong><small>Blank login works only when <code>ALLOW_DEMO_AUTH</code> is enabled for a local or staging deployment.</small></span>
           </div>
         </form>
       </section>
@@ -1101,18 +1297,65 @@ function App() {
     localStorage.setItem("hr-doc-generator-theme", theme);
   }, [theme]);
 
-  const handleLogin = (session: AuthSession, remember: boolean) => {
-    try {
+  useEffect(() => {
+    if (!authSession) return;
+    const localDemo = ["localhost", "127.0.0.1"].includes(window.location.hostname) && !authSession.userId;
+    if (localDemo) return;
+    if (!authSession.userId) {
       localStorage.removeItem(authStorageKey);
       sessionStorage.removeItem(authStorageKey);
-      const storage = remember ? localStorage : sessionStorage;
-      storage.setItem(authStorageKey, JSON.stringify(session));
-    } finally {
-      setAuthSession(session);
+      setAuthSession(null);
+      return;
     }
+    let cancelled = false;
+    fetch("/api/auth/session", { headers: { Accept: "application/json" } })
+      .then((response) => readCloudResponse<{ ok: true; session: Pick<AuthSession, "userId" | "workspaceId" | "email" | "role"> }>(response))
+      .then((result) => {
+        if (!cancelled) setAuthSession((current) => current ? { ...current, ...result.session } : current);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        localStorage.removeItem(authStorageKey);
+        sessionStorage.removeItem(authStorageKey);
+        setAuthSession(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authSession?.userId]);
+
+  const handleLogin = async (email: string, password: string, remember: boolean) => {
+    let session: AuthSession;
+    try {
+      const response = await fetch("/api/auth/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ email, password, remember }),
+      });
+      const result = await response.json() as { ok?: boolean; error?: string; session?: AuthSession };
+      if (!response.ok || !result.ok || !result.session) throw new Error(result.error || "The server could not create a trusted session.");
+      session = result.session;
+    } catch (error) {
+      const localDemo = !email && !password && ["localhost", "127.0.0.1"].includes(window.location.hostname);
+      if (!localDemo) throw error;
+      session = {
+        displayName: "Demo HR user",
+        email: "",
+        role: "Admin",
+        workspaceId: "local-demo",
+        workspaceName: "Local demo workspace",
+        signedInAt: new Date().toISOString(),
+      };
+    }
+    localStorage.removeItem(authStorageKey);
+    sessionStorage.removeItem(authStorageKey);
+    const storage = remember ? localStorage : sessionStorage;
+    storage.setItem(authStorageKey, JSON.stringify(session));
+    setAuthSession(session);
   };
 
   const handleSignOut = () => {
+    void fetch("/api/auth/session", { method: "DELETE", headers: { Accept: "application/json" } }).catch(() => undefined);
     localStorage.removeItem(authStorageKey);
     sessionStorage.removeItem(authStorageKey);
     setAuthSession(null);
@@ -1252,7 +1495,7 @@ function WorkspaceApp({
     CustomPlaceholder[]
   >([]);
   const [docName, setDocName] = useState("Marcus Lee · Fixed-Term Agreement");
-  const [currentRole, setCurrentRole] = useState<UserRole>("Admin");
+  const [currentRole, setCurrentRole] = useState<UserRole>(authSession.role || "Admin");
   const [roleMenuOpen, setRoleMenuOpen] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<"Connected" | "Syncing" | "Failed">("Connected");
   const [connectionError, setConnectionError] = useState("");
@@ -1270,12 +1513,17 @@ function WorkspaceApp({
   const [compareVersionId, setCompareVersionId] = useState<string | null>(null);
   const [restoreVersionId, setRestoreVersionId] = useState<string | null>(null);
   const [templateVersions, setTemplateVersions] = useState<Record<string, number>>({});
+  const [templateLayouts, setTemplateLayouts] = useState<Record<string, Letterhead>>({});
   const [versionCounter, setVersionCounter] = useState(0);
   const [dependencyTarget, setDependencyTarget] = useState<string | null>(null);
   const [exportState, setExportState] = useState<"idle" | "exporting" | "error">("idle");
   const [exportError, setExportError] = useState("");
   const [zoom, setZoom] = useState(92);
   const [fontSize, setFontSize] = useState(11);
+  const [fontSizeMenu, setFontSizeMenu] = useState<{
+    top: number;
+    left: number;
+  } | null>(null);
   const [format, setFormat] = useState({
     bold: false,
     italic: false,
@@ -1283,19 +1531,211 @@ function WorkspaceApp({
     strike: false,
     align: "left",
   });
+  const [localHydrated, setLocalHydrated] = useState(false);
+  const [cloudHydrated, setCloudHydrated] = useState(false);
+  const cloudExpected = Boolean(authSession.userId && authSession.workspaceId && authSession.workspaceId !== "local-demo");
+  const [cloudAvailable, setCloudAvailable] = useState(cloudExpected);
+  const [cloudConflict, setCloudConflict] = useState(false);
   const editorRef = useRef<HTMLDivElement>(null);
   const letterheadInputRef = useRef<HTMLInputElement>(null);
   const placeholderImportInputRef = useRef<HTMLInputElement>(null);
   const moduleDrawerRef = useRef<HTMLElement | null>(null);
   const activeEditorRef = useRef<HTMLDivElement | null>(null);
   const savedRangeRef = useRef<Range | null>(null);
+  const preserveEditorSelectionRef = useRef(false);
+  const pendingFontSizeRestoreRef = useRef<number | null>(null);
   const versionCounterRef = useRef(0);
+  const cloudRevisionRef = useRef<number | null>(null);
+  const cloudSaveChainRef = useRef<Promise<void>>(Promise.resolve());
   const selectionBookmarkRef = useRef<{
     clauseId: string;
     start: number;
     end: number;
     text: string;
   } | null>(null);
+
+  const makeWorkspaceState = (
+    savedStamp = lastSavedAt || formatDocumentStamp(),
+    overrides: Partial<WorkspacePersistedState> = {},
+  ): WorkspacePersistedState => ({
+    templates: clone(templates),
+    templateId,
+    personId,
+    values: clone(values),
+    letterhead: clone(letterhead),
+    watermark: clone(watermark),
+    sections: clone(sections),
+    canvasBlocks: clone(canvasBlocks),
+    docName,
+    docStatus,
+    workflowStage,
+    customPlaceholders: clone(customPlaceholders),
+    currentRole,
+    connectionStatus,
+    connectionError,
+    lastSyncAt,
+    lastSavedAt: savedStamp,
+    sourceSnapshots: clone(sourceSnapshots),
+    sourceUpdates: clone(sourceUpdates),
+    sourceUpdateMeta: clone(sourceUpdateMeta),
+    manualOverrides: clone(manualOverrides),
+    versions: clone(versions),
+    templateVersions: clone(templateVersions),
+    templateLayouts: clone(templateLayouts),
+    versionCounter,
+    ...overrides,
+  });
+
+  const makeCloudPayload = (
+    savedStamp = lastSavedAt || formatDocumentStamp(),
+    workspaceOverrides: Partial<WorkspacePersistedState> = {},
+    storeOverride?: AppStore,
+  ): CloudWorkspacePayload => {
+    const workspace = makeWorkspaceState(savedStamp, workspaceOverrides);
+    const sourceStore = storeOverride || appStore;
+    const existing = sourceStore.documents.find((item) => item.id === "doc-current");
+    const currentDocument: DocumentRecord = {
+      id: "doc-current",
+      docName: workspace.docName,
+      templateId: workspace.templateId,
+      personId: workspace.personId,
+      companyId,
+      status: workspace.docStatus === "In review" ? "in-review" : workspace.docStatus === "Approved" ? "approved" : "draft",
+      generationStatus: existing?.generationStatus || "not-generated",
+      sections: clone(workspace.sections),
+      values: clone(workspace.values),
+      letterhead: clone(workspace.letterhead),
+      watermark: clone(workspace.watermark),
+      versions: clone(workspace.versions),
+      exports: clone(existing?.exports || []),
+      updatedAt: savedStamp,
+      canvasBlocks: clone(workspace.canvasBlocks),
+    };
+    const synchronizedStore: AppStore = {
+      ...sourceStore,
+      navigation: { ...sourceStore.navigation, module: activeModule, sidebarCollapsed },
+      documents: [currentDocument, ...sourceStore.documents.filter((item) => item.id !== currentDocument.id)],
+    };
+    return {
+      schemaVersion: 2,
+      appStore: synchronizedStore,
+      workspace,
+      preferences: {
+        theme,
+        navigation: synchronizedStore.navigation,
+        editor: { zoom, fontSize },
+        notifications: {},
+      },
+    };
+  };
+
+  const applyWorkspaceState = (state: Partial<WorkspacePersistedState>) => {
+    const restoredSections = state.sections || clone(demoTemplates[1].sections);
+    setTemplates(state.templates || demoTemplates);
+    setTemplateId(state.templateId || "fixed");
+    setPersonId(state.personId || "EMP-2041");
+    setValues(state.values || people[1].fields);
+    setLetterhead(normalizeLetterhead(state.letterhead));
+    setWatermark(normalizeWatermark(state.watermark));
+    setSections(restoredSections);
+    setCanvasBlocks(state.canvasBlocks || makeDefaultCanvasBlocks(restoredSections));
+    setActiveSection(restoredSections[0]?.id || "");
+    setActiveClause(restoredSections[0]?.clauses[0]?.id || "");
+    setDocName(state.docName || "Marcus Lee · Fixed-Term Agreement");
+    setDocStatus(state.docStatus || "Draft");
+    setWorkflowStage(state.workflowStage || "build");
+    setCustomPlaceholders(state.customPlaceholders || []);
+    setCurrentRole(authSession.role || state.currentRole || "Admin");
+    setConnectionStatus(state.connectionStatus || "Connected");
+    setConnectionError(state.connectionError || "");
+    setLastSyncAt(state.lastSyncAt || "");
+    setLastSavedAt(state.lastSavedAt || "");
+    setSourceSnapshots(state.sourceSnapshots || {});
+    setSourceUpdates(state.sourceUpdates || {});
+    setSourceUpdateMeta(state.sourceUpdateMeta || {});
+    setManualOverrides(state.manualOverrides || []);
+    setVersions(state.versions || []);
+    setTemplateVersions(state.templateVersions || {});
+    setTemplateLayouts(state.templateLayouts || {});
+    const restoredCounter = Number(state.versionCounter || state.versions?.length || 0);
+    versionCounterRef.current = restoredCounter;
+    setVersionCounter(restoredCounter);
+  };
+
+  const persistCloudPayload = (payload: CloudWorkspacePayload) => {
+    if (!cloudAvailable || !authSession.userId || !authSession.workspaceId) return Promise.resolve();
+    const run = cloudSaveChainRef.current.catch(() => undefined).then(async () => {
+      if (JSON.stringify(payload).includes('"data:')) {
+        const migrated = await moveEmbeddedAssetsToStorage(payload);
+        Object.assign(payload, migrated);
+      }
+      const result = await saveCloudWorkspace(payload, cloudRevisionRef.current);
+      cloudRevisionRef.current = result.state.revision;
+      setCloudConflict(false);
+    });
+    cloudSaveChainRef.current = run.then(() => undefined, () => undefined);
+    return run;
+  };
+
+  useLayoutEffect(() => {
+    const pendingSize = pendingFontSizeRestoreRef.current;
+    const bookmark = selectionBookmarkRef.current;
+    if (pendingSize === null || !bookmark) return;
+    const editor = Array.from(
+      document.querySelectorAll<HTMLDivElement>(".editable-paragraph"),
+    ).find((node) => node.dataset.clauseId === bookmark.clauseId);
+    if (!editor || bookmark.start === bookmark.end) {
+      pendingFontSizeRestoreRef.current = null;
+      preserveEditorSelectionRef.current = false;
+      return;
+    }
+    const locateOffset = (offset: number) => {
+      const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+      let consumed = 0;
+      let node = walker.nextNode() as Text | null;
+      let last: Text | null = null;
+      while (node) {
+        last = node;
+        const next = consumed + node.data.length;
+        if (offset <= next)
+          return { node, offset: Math.max(0, offset - consumed) };
+        consumed = next;
+        node = walker.nextNode() as Text | null;
+      }
+      return last ? { node: last, offset: last.data.length } : null;
+    };
+    const startPoint = locateOffset(bookmark.start);
+    const endPoint = locateOffset(bookmark.end);
+    if (!startPoint || !endPoint) {
+      pendingFontSizeRestoreRef.current = null;
+      preserveEditorSelectionRef.current = false;
+      return;
+    }
+    const restoredRange = document.createRange();
+    restoredRange.setStart(startPoint.node, startPoint.offset);
+    restoredRange.setEnd(endPoint.node, endPoint.offset);
+    editor.focus({ preventScroll: true });
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(restoredRange);
+    activeEditorRef.current = editor;
+    savedRangeRef.current = restoredRange.cloneRange();
+    setFontSize(pendingSize);
+    pendingFontSizeRestoreRef.current = null;
+    preserveEditorSelectionRef.current = false;
+  }, [sections]);
+
+  useEffect(() => {
+    if (!fontSizeMenu) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        preserveEditorSelectionRef.current = false;
+        setFontSizeMenu(null);
+      }
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [fontSizeMenu]);
 
   useEffect(() => {
     const onHashChange = () => setActiveModule(moduleFromHash(window.location.hash));
@@ -1533,86 +1973,103 @@ function WorkspaceApp({
     const saved = localStorage.getItem(storageKey);
     if (saved) {
       try {
-        const state = JSON.parse(saved);
-        setTemplateId(state.templateId || "fixed");
-        setPersonId(state.personId || "EMP-2041");
-        setValues(state.values || people[1].fields);
-        setLetterhead(normalizeLetterhead(state.letterhead));
-        setWatermark(normalizeWatermark(state.watermark));
-        const restoredSections = state.sections || clone(demoTemplates[1].sections);
-        setSections(restoredSections);
-        setCanvasBlocks(state.canvasBlocks || makeDefaultCanvasBlocks(restoredSections));
-        setActiveSection(restoredSections[0]?.id || "");
-        setActiveClause(restoredSections[0]?.clauses[0]?.id || "");
-        setDocName(state.docName || "Marcus Lee · Fixed-Term Agreement");
-        setDocStatus(state.docStatus || "Draft");
-        setWorkflowStage(state.workflowStage || "build");
-        setCustomPlaceholders(state.customPlaceholders || []);
-        setCurrentRole(state.currentRole || "Admin");
-        setConnectionStatus(state.connectionStatus || "Connected");
-        setConnectionError(state.connectionError || "");
-        setLastSyncAt(state.lastSyncAt || "");
-        setLastSavedAt(state.lastSavedAt || "");
-        setSourceSnapshots(state.sourceSnapshots || {});
-        setSourceUpdates(state.sourceUpdates || {});
-        setSourceUpdateMeta(state.sourceUpdateMeta || {});
-        setManualOverrides(state.manualOverrides || []);
-        setVersions(state.versions || []);
-        setTemplateVersions(state.templateVersions || {});
-        const restoredCounter = Number(state.versionCounter || state.versions?.length || 0);
-        versionCounterRef.current = restoredCounter;
-        setVersionCounter(restoredCounter);
+        applyWorkspaceState(JSON.parse(saved) as WorkspacePersistedState);
       } catch {
         setSaving("error");
         setToast("Saved workspace could not be read. Start a fresh draft or clear local data.");
       }
     }
+    setLocalHydrated(true);
   }, []);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      setSaving("saving");
-      window.setTimeout(() => {
-        try {
+    if (!localHydrated) return;
+    if (!cloudExpected || !authSession.userId || !authSession.workspaceId) {
+      setCloudAvailable(false);
+      setCloudHydrated(true);
+      return;
+    }
+    let cancelled = false;
+    setSaving("saving");
+    loadCloudWorkspace()
+      .then(async (result) => {
+        if (cancelled) return;
+        if (result.state?.payload) {
+          const cloudPayload = result.state.payload;
+          const backupKey = `${storageKey}-pre-cloud-${Date.now()}`;
+          const localBackup = localStorage.getItem(storageKey);
+          if (localBackup) localStorage.setItem(backupKey, localBackup);
+          cloudRevisionRef.current = result.state.revision;
+          if (JSON.stringify(cloudPayload).includes('"data:')) await persistCloudPayload(cloudPayload);
+          setAppStore(cloudPayload.appStore);
+          applyWorkspaceState(cloudPayload.workspace);
+          localStorage.setItem(appStoreKey, JSON.stringify(cloudPayload.appStore));
+          localStorage.setItem(storageKey, JSON.stringify(cloudPayload.workspace));
+          const navigation = result.preferences?.navigation || cloudPayload.preferences?.navigation;
+          if (navigation) {
+            setSidebarCollapsed(Boolean(navigation.sidebarCollapsed));
+            if (!window.location.hash) setActiveModule(navigation.module || "workspace");
+          }
+          const savedTheme = result.preferences?.theme || cloudPayload.preferences?.theme;
+          if (savedTheme === "light" || savedTheme === "dark") setTheme(savedTheme);
+          const editor = cloudPayload.preferences?.editor;
+          if (editor) {
+            setZoom(Number(editor.zoom || 92));
+            setFontSize(normalizeEditorFontSize(editor.fontSize));
+          }
+          setModuleNotice(`Cloud workspace restored · revision ${cloudRevisionRef.current}`);
+        } else {
+          cloudRevisionRef.current = 0;
           const savedStamp = formatDocumentStamp();
-          localStorage.setItem(
-            storageKey,
-            JSON.stringify({
-              templates,
-              templateId,
-              personId,
-              values,
-              letterhead,
-              watermark,
-              sections,
-              canvasBlocks,
-              docName,
-              docStatus,
-              workflowStage,
-              customPlaceholders,
-              currentRole,
-              connectionStatus,
-              connectionError,
-              lastSyncAt,
-              lastSavedAt: savedStamp,
-              sourceSnapshots,
-              sourceUpdates,
-              sourceUpdateMeta,
-              manualOverrides,
-              versions,
-              templateVersions,
-              versionCounter,
-            }),
-          );
-          setLastSavedAt(savedStamp);
-          setSaving("saved");
-        } catch {
-          setSaving("error");
-          setToast("Auto-save failed. Use Save to retry.");
-          window.setTimeout(() => setToast(""), 2400);
+          const migrated = makeCloudPayload(savedStamp);
+          await persistCloudPayload(migrated);
+          if (cancelled) return;
+          localStorage.setItem(appStoreKey, JSON.stringify(migrated.appStore));
+          localStorage.setItem(storageKey, JSON.stringify(migrated.workspace));
+          setModuleNotice("Existing browser data migrated to Supabase");
         }
-      }, 350);
-    }, 800);
+        if (cancelled) return;
+        setCurrentRole(result.role);
+        setCloudAvailable(true);
+        setCloudHydrated(true);
+        setSaving("saved");
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setCloudAvailable(false);
+        setCloudHydrated(true);
+        setSaving("error");
+        setModuleNotice(error instanceof Error ? `Cloud save unavailable: ${error.message}` : "Cloud save unavailable");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [localHydrated, authSession.userId, authSession.workspaceId]);
+
+  useEffect(() => {
+    if (!localHydrated || !cloudHydrated) return;
+    const timer = window.setTimeout(async () => {
+      setSaving("saving");
+      const savedStamp = formatDocumentStamp();
+      const payload = makeCloudPayload(savedStamp);
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+        localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+        if (cloudExpected && !cloudAvailable) throw new Error("Supabase is unavailable; the local recovery copy was kept.");
+        if (cloudAvailable) await persistCloudPayload(payload);
+        localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+        localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+        setLastSavedAt(savedStamp);
+        setSaving("saved");
+      } catch (error) {
+        const conflict = error instanceof CloudStateError && error.code === "STATE_CONFLICT";
+        setCloudConflict(conflict);
+        setSaving("error");
+        setModuleNotice(conflict
+          ? "Cloud conflict detected. Reload before saving so another user's changes are not overwritten."
+          : `Auto-save failed: ${error instanceof Error ? error.message : "Unknown cloud error"}`);
+      }
+    }, 900);
     return () => window.clearTimeout(timer);
   }, [
     templates,
@@ -1637,7 +2094,18 @@ function WorkspaceApp({
     manualOverrides,
     versions,
     templateVersions,
+    templateLayouts,
     versionCounter,
+    appStore,
+    activeModule,
+    sidebarCollapsed,
+    theme,
+    zoom,
+    fontSize,
+    localHydrated,
+    cloudHydrated,
+    cloudAvailable,
+    cloudExpected,
   ]);
 
   useEffect(() => {
@@ -1805,6 +2273,26 @@ function WorkspaceApp({
       ".editable-paragraph",
     ) as HTMLDivElement | null;
     if (!editor) return;
+    const focusWithinEditor =
+      document.activeElement === editor ||
+      Boolean(document.activeElement && editor.contains(document.activeElement));
+    if (
+      range.collapsed &&
+      (preserveEditorSelectionRef.current || !focusWithinEditor)
+    )
+      return;
+    const selectionElement =
+      range.startContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.startContainer as HTMLElement)
+        : range.startContainer.parentElement;
+    if (selectionElement) {
+      const selectedSize = normalizeEditorFontSize(
+        window.getComputedStyle(selectionElement).fontSize,
+      );
+      setFontSize((current) =>
+        current === selectedSize ? current : selectedSize,
+      );
+    }
     activeEditorRef.current = editor;
     savedRangeRef.current = range.cloneRange();
     const clauseId = editor.dataset.clauseId;
@@ -1844,6 +2332,11 @@ function WorkspaceApp({
         : nextFormat,
     );
   };
+  useEffect(() => {
+    const syncSelection = () => rememberSelection();
+    document.addEventListener("selectionchange", syncSelection);
+    return () => document.removeEventListener("selectionchange", syncSelection);
+  }, []);
   const applyEditorCommand = (command: string, value?: string): boolean => {
     if (!guardEdit()) return false;
     const historyCommand = command === "undo" || command === "redo";
@@ -1880,7 +2373,10 @@ function WorkspaceApp({
       const liveEditor = anchor?.closest(
         ".editable-paragraph",
       ) as HTMLDivElement | null;
-      if (liveEditor) {
+      const rememberedTextSelection =
+        rememberedBookmark &&
+        rememberedBookmark.start !== rememberedBookmark.end;
+      if (liveEditor && (!liveRange.collapsed || !rememberedTextSelection)) {
         const before = liveRange.cloneRange();
         before.selectNodeContents(liveEditor);
         before.setEnd(liveRange.startContainer, liveRange.startOffset);
@@ -1901,7 +2397,14 @@ function WorkspaceApp({
       const rememberedRange = savedRangeRef.current;
       const startNode = rememberedRange.startContainer;
       const endNode = rememberedRange.endContainer;
-      if (editor.contains(startNode) && editor.contains(endNode)) {
+      const bookmarkHasText =
+        rememberedBookmark &&
+        rememberedBookmark.start !== rememberedBookmark.end;
+      if (
+        editor.contains(startNode) &&
+        editor.contains(endNode) &&
+        (!rememberedRange.collapsed || !bookmarkHasText)
+      ) {
         activeRange = rememberedRange.cloneRange();
       }
     }
@@ -1993,7 +2496,7 @@ function WorkspaceApp({
       fontSize: {
         tag: "span",
         style: {
-          fontSize: value === "2" ? "10px" : value === "4" ? "16px" : "13px",
+          fontSize: `${normalizeEditorFontSize(value)}px`,
         },
       },
       createLink: { tag: "a", href: value },
@@ -2086,8 +2589,30 @@ function WorkspaceApp({
         wrapper.target = "_blank";
         wrapper.rel = "noreferrer";
       }
-      wrapper.appendChild(range.extractContents());
+      const contents = range.extractContents();
+      if (command === "fontSize") {
+        contents.querySelectorAll<HTMLElement>("[style]").forEach((node) => {
+          node.style.removeProperty("font-size");
+          if (!node.style.length) node.removeAttribute("style");
+        });
+      }
+      wrapper.appendChild(contents);
       range.insertNode(wrapper);
+      if (command === "fontSize") {
+        let ancestor = wrapper.parentElement;
+        while (ancestor && ancestor !== editor) {
+          const nextAncestor = ancestor.parentElement;
+          if (
+            ancestor.tagName === "SPAN" &&
+            ancestor.style.fontSize &&
+            ancestor.textContent === wrapper.textContent
+          ) {
+            ancestor.style.removeProperty("font-size");
+            if (!ancestor.style.length) ancestor.removeAttribute("style");
+          }
+          ancestor = nextAncestor;
+        }
+      }
       const nextRange = document.createRange();
       nextRange.selectNodeContents(wrapper);
       selection?.removeAllRanges();
@@ -2108,6 +2633,27 @@ function WorkspaceApp({
     return true;
   };
   const toolbarMouseDown = (event: React.MouseEvent) => event.preventDefault();
+  const applySelectedFontSize = (nextSize: number) => {
+    const normalizedSize = normalizeEditorFontSize(nextSize);
+    pendingFontSizeRestoreRef.current = normalizedSize;
+    const applied = applyEditorCommand("fontSize", String(normalizedSize));
+    if (!applied) {
+      pendingFontSizeRestoreRef.current = null;
+      preserveEditorSelectionRef.current = false;
+      return;
+    }
+    setFontSize(normalizedSize);
+  };
+  const stepSelectedFontSize = (direction: 1 | -1) => {
+    const currentSize = normalizeEditorFontSize(fontSize);
+    const nextSize =
+      direction === 1
+        ? EDITOR_FONT_SIZES.find((size) => size > currentSize) ??
+          EDITOR_FONT_SIZES[EDITOR_FONT_SIZES.length - 1]
+        : [...EDITOR_FONT_SIZES].reverse().find((size) => size < currentSize) ??
+          EDITOR_FONT_SIZES[0];
+    applySelectedFontSize(nextSize);
+  };
 
   const commitPersonChange = (id: string) => {
     if (!guardEdit()) return;
@@ -2149,6 +2695,7 @@ function WorkspaceApp({
     const nextSections = clone(next.sections);
     setSections(nextSections);
     setCanvasBlocks(makeDefaultCanvasBlocks(nextSections));
+    if (templateLayouts[id]) setLetterhead(normalizeLetterhead(templateLayouts[id]));
     setActiveSection(next.sections[0].id);
     setActiveClause(next.sections[0].clauses[0]?.id || "");
     setDocName(`${person.name} · ${next.type}`);
@@ -2784,19 +3331,16 @@ function WorkspaceApp({
       });
       return next;
     });
-  const buildVersion = (
+  const makeVersionSnapshot = (
+    revision: number,
     summary: string,
     status: DocumentVersion["status"],
     payload: Partial<DocumentVersion> = {},
-  ): DocumentVersion => {
-    const revision = Math.max(versionCounterRef.current + 1, versionCounter + 1);
-    versionCounterRef.current = revision;
-    setVersionCounter(revision);
-    return {
+  ): DocumentVersion => ({
       id: `v-${Date.now()}-${revision}`,
       label: `v${revision}.0 · ${status}`,
       createdAt: formatDocumentStamp(),
-      author: currentRole === "Reviewer" ? "Reviewer" : "JL",
+      author: authSession.displayName || (currentRole === "Reviewer" ? "Reviewer" : "HR user"),
       status,
       summary,
       sections: clone(payload.sections ?? sections),
@@ -2813,7 +3357,16 @@ function WorkspaceApp({
       sourceUpdates: clone(payload.sourceUpdates ?? sourceUpdates),
       sourceUpdateMeta: clone(payload.sourceUpdateMeta ?? sourceUpdateMeta),
       canvasBlocks: clone(payload.canvasBlocks ?? canvasBlocks),
-    };
+    });
+  const buildVersion = (
+    summary: string,
+    status: DocumentVersion["status"],
+    payload: Partial<DocumentVersion> = {},
+  ): DocumentVersion => {
+    const revision = Math.max(versionCounterRef.current + 1, versionCounter + 1);
+    versionCounterRef.current = revision;
+    setVersionCounter(revision);
+    return makeVersionSnapshot(revision, summary, status, payload);
   };
   const createVersion = (
     summary: string,
@@ -2824,7 +3377,7 @@ function WorkspaceApp({
     setVersions((prev) => [version, ...prev].slice(0, 12));
     return version;
   };
-  const restoreVersionNow = (version: DocumentVersion) => {
+  const restoreVersionNow = async (version: DocumentVersion) => {
     const restoredSections = clone(version.sections);
     const restoredValues = clone(version.values);
     const restoredLetterhead = normalizeLetterhead(version.letterhead);
@@ -2838,30 +3391,17 @@ function WorkspaceApp({
     const restoredCanvasBlocks = clone(
       version.canvasBlocks || makeDefaultCanvasBlocks(restoredSections),
     );
-    setSections(restoredSections);
-    setCanvasBlocks(restoredCanvasBlocks);
-    setValues(restoredValues);
-    setLetterhead(restoredLetterhead);
-    setWatermark(restoredWatermark);
-    setDocName(restoredDocName);
-    setPersonId(restoredPersonId);
-    setTemplateId(restoredTemplateId);
-    setActiveSection(restoredSections[0]?.id || "");
-    setActiveClause(restoredSections[0]?.clauses[0]?.id || "");
-    setSourceSnapshots((prev) => ({
-      ...prev,
+    const nextSourceSnapshots = {
+      ...sourceSnapshots,
       [restoredPersonId]: clone(
         version.sourceSnapshot ||
-          prev[restoredPersonId] ||
+          sourceSnapshots[restoredPersonId] ||
           people.find((item) => item.id === restoredPersonId)?.fields ||
           {},
       ),
-    }));
-    setManualOverrides(restoredOverrides);
-    setSourceUpdates(restoredUpdates);
-    setSourceUpdateMeta(restoredMeta);
-    setDocStatus("Draft");
-    const restoredSnapshot = buildVersion(`Restored from ${version.label}`, "Draft", {
+    };
+    const nextRevision = Math.max(versionCounterRef.current + 1, versionCounter + 1);
+    const restoredSnapshot = makeVersionSnapshot(nextRevision, `Restored from ${version.label}`, "Draft", {
       sections: restoredSections,
       values: restoredValues,
       letterhead: restoredLetterhead,
@@ -2877,58 +3417,163 @@ function WorkspaceApp({
       sourceUpdateMeta: restoredMeta,
       canvasBlocks: restoredCanvasBlocks,
     });
-    setVersions((prev) => [restoredSnapshot, ...prev].slice(0, 12));
-    setRestoreVersionId(null);
-    setShowHistory(false);
-    setToast(`${version.label} restored as a new draft`);
-    window.setTimeout(() => setToast(""), 2600);
+    const nextVersions = [restoredSnapshot, ...versions].slice(0, 12);
+    const savedStamp = formatDocumentStamp();
+    const payload = makeCloudPayload(savedStamp, {
+      sections: restoredSections,
+      canvasBlocks: restoredCanvasBlocks,
+      values: restoredValues,
+      letterhead: restoredLetterhead,
+      watermark: restoredWatermark,
+      docName: restoredDocName,
+      personId: restoredPersonId,
+      templateId: restoredTemplateId,
+      sourceSnapshots: nextSourceSnapshots,
+      manualOverrides: restoredOverrides,
+      sourceUpdates: restoredUpdates,
+      sourceUpdateMeta: restoredMeta,
+      docStatus: "Draft",
+      workflowStage: "build",
+      versions: nextVersions,
+      versionCounter: nextRevision,
+    });
+    setSaving("saving");
+    try {
+      if (cloudExpected && !cloudAvailable) throw new Error("Supabase is unavailable; the current document was left unchanged.");
+      if (cloudAvailable) await persistCloudPayload(payload);
+      localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+      localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+      versionCounterRef.current = nextRevision;
+      setVersionCounter(nextRevision);
+      setAppStore(payload.appStore);
+      setSections(restoredSections);
+      setCanvasBlocks(restoredCanvasBlocks);
+      setValues(restoredValues);
+      setLetterhead(restoredLetterhead);
+      setWatermark(restoredWatermark);
+      setDocName(restoredDocName);
+      setPersonId(restoredPersonId);
+      setTemplateId(restoredTemplateId);
+      setActiveSection(restoredSections[0]?.id || "");
+      setActiveClause(restoredSections[0]?.clauses[0]?.id || "");
+      setSourceSnapshots(nextSourceSnapshots);
+      setManualOverrides(restoredOverrides);
+      setSourceUpdates(restoredUpdates);
+      setSourceUpdateMeta(restoredMeta);
+      setDocStatus("Draft");
+      setWorkflowStage("build");
+      setVersions(nextVersions);
+      setLastSavedAt(savedStamp);
+      setSaving("saved");
+      setCloudConflict(false);
+      setRestoreVersionId(null);
+      setShowHistory(false);
+      setToast(`${version.label} restored and saved as a new draft`);
+    } catch (error) {
+      const conflict = error instanceof CloudStateError && error.code === "STATE_CONFLICT";
+      setCloudConflict(conflict);
+      setSaving("error");
+      setToast(conflict
+        ? "Restore was not applied. Reload the cloud version before retrying."
+        : `Restore failed and the document was left unchanged: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
+    window.setTimeout(() => setToast(""), 2800);
   };
-  const saveNow = () => {
+  const saveNow = async () => {
+    setSaving("saving");
     try {
       const nextStatus = docStatus === "Approved" ? "Draft" : docStatus;
-      const version = buildVersion(
+      const nextRevision = Math.max(versionCounterRef.current + 1, versionCounter + 1);
+      const version = makeVersionSnapshot(
+        nextRevision,
         docStatus === "Approved" ? "Approved file edited; new draft created" : "Manual save",
         nextStatus,
       );
       const nextVersions = [version, ...versions].slice(0, 12);
-      localStorage.setItem(
-        storageKey,
-        JSON.stringify({
-          templates,
-          templateId,
-          personId,
-          values,
-          letterhead,
-          watermark,
-          sections,
-          canvasBlocks,
-          docName,
-          docStatus: nextStatus,
-          customPlaceholders,
-          currentRole,
-          connectionStatus,
-          connectionError,
-          lastSyncAt,
-          lastSavedAt: formatDocumentStamp(),
-          sourceSnapshots,
-          sourceUpdates,
-          sourceUpdateMeta,
-          manualOverrides,
-          versions: nextVersions,
-          templateVersions,
-          versionCounter: versionCounterRef.current,
-        }),
-      );
+      const savedStamp = formatDocumentStamp();
+      const payload = makeCloudPayload(savedStamp, {
+        docStatus: nextStatus,
+        versions: nextVersions,
+        versionCounter: nextRevision,
+      });
+      localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+      localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+      if (cloudExpected && !cloudAvailable) throw new Error("Supabase is unavailable; the local recovery copy was kept.");
+      if (cloudAvailable) await persistCloudPayload(payload);
+      localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+      localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+      setAppStore(payload.appStore);
+      versionCounterRef.current = nextRevision;
+      setVersionCounter(nextRevision);
       setVersions(nextVersions);
       if (docStatus === "Approved") setDocStatus("Draft");
-      setLastSavedAt(formatDocumentStamp());
+      setLastSavedAt(savedStamp);
       setSaving("saved");
-      setToast("Saved and versioned in local workspace");
-    } catch {
+      setCloudConflict(false);
+      setToast(cloudAvailable ? "Saved and versioned in Supabase" : "Saved and versioned in local demo workspace");
+    } catch (error) {
+      const conflict = error instanceof CloudStateError && error.code === "STATE_CONFLICT";
+      setCloudConflict(conflict);
       setSaving("error");
-      setToast("Save failed. Check browser storage and retry.");
+      setToast(conflict
+        ? "Save conflict: reload the cloud version before retrying"
+        : `Save failed: ${error instanceof Error ? error.message : "Unknown error"}`);
     }
     window.setTimeout(() => setToast(""), 2400);
+  };
+  const transitionDocumentStatus = async () => {
+    if (blockingIssues.length) {
+      setToast("Fix the highlighted checks before review");
+      window.setTimeout(() => setToast(""), 2400);
+      goToWorkflowStage("review");
+      return;
+    }
+    if (docStatus === "Approved") return;
+    if (docStatus === "In review" && currentRole !== "Reviewer") {
+      goToWorkflowStage("review");
+      return;
+    }
+
+    const approving = currentRole === "Reviewer" && docStatus === "In review";
+    const nextStatus: WorkspacePersistedState["docStatus"] = approving ? "Approved" : "In review";
+    const nextWorkflowStage: WorkflowStage = approving ? "export" : "review";
+    const summary = approving ? "Approved by reviewer" : "Submitted for review";
+    const nextRevision = Math.max(versionCounterRef.current + 1, versionCounter + 1);
+    const version = makeVersionSnapshot(nextRevision, summary, nextStatus);
+    const nextVersions = [version, ...versions].slice(0, 12);
+    const savedStamp = formatDocumentStamp();
+    const payload = makeCloudPayload(savedStamp, {
+      docStatus: nextStatus,
+      workflowStage: nextWorkflowStage,
+      versions: nextVersions,
+      versionCounter: nextRevision,
+    });
+
+    setSaving("saving");
+    try {
+      if (cloudExpected && !cloudAvailable) throw new Error("Supabase is unavailable; the current review status was left unchanged.");
+      if (cloudAvailable) await persistCloudPayload(payload);
+      localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+      localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+      versionCounterRef.current = nextRevision;
+      setVersionCounter(nextRevision);
+      setAppStore(payload.appStore);
+      setVersions(nextVersions);
+      setDocStatus(nextStatus);
+      setWorkflowStage(nextWorkflowStage);
+      setLastSavedAt(savedStamp);
+      setSaving("saved");
+      setCloudConflict(false);
+      setToast(approving ? "Document approved and version locked in Supabase" : "Document saved and submitted for review");
+    } catch (error) {
+      const conflict = error instanceof CloudStateError && error.code === "STATE_CONFLICT";
+      setCloudConflict(conflict);
+      setSaving("error");
+      setToast(conflict
+        ? "Approval state was not changed. Reload the cloud version before retrying."
+        : `Status change failed and was not applied: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
+    window.setTimeout(() => setToast(""), 2800);
   };
   const createPlaceholder = (labelInput?: string) => {
     if (!guardEdit()) return;
@@ -3026,7 +3671,7 @@ function WorkspaceApp({
     if (request.kind === "rename") renameDocument(request.value);
     if (request.kind === "link") insertLink(request.value);
   };
-  const uploadLetterhead = (file?: File) => {
+  const uploadLetterhead = async (file?: File) => {
     if (!guardEdit()) return;
     if (!file) return;
     const supported = [
@@ -3040,35 +3685,45 @@ function WorkspaceApp({
       window.setTimeout(() => setToast(""), 2600);
       return;
     }
-    if (file.size > 2_000_000) {
-      setToast(
-        "Letterhead files must be 2 MB or smaller in this local workspace",
-      );
+    const maximumSize = cloudExpected ? 50 * 1024 * 1024 : 2_000_000;
+    if (file.size > maximumSize) {
+      setToast(cloudExpected
+        ? "Letterhead files must be 50 MB or smaller"
+        : "Letterhead files must be 2 MB or smaller in this local demo workspace");
       window.setTimeout(() => setToast(""), 2800);
       return;
     }
-    if (file.type.startsWith("image/")) {
-      const reader = new FileReader();
-      reader.onload = () =>
+    try {
+      if (cloudExpected) {
+        if (!cloudAvailable) throw new Error("Supabase Storage is unavailable. Retry after the cloud connection is restored.");
+        setToast("Uploading Letterhead to private storage…");
+        const asset = await uploadPrivateAsset(file, file.name, "letterhead");
         updateActiveLetterhead({
           fileName: file.name,
           fileType: file.type,
-          dataUrl: String(reader.result),
+          storagePath: asset.storagePath,
+          dataUrl: file.type.startsWith("image/") ? assetFileUrl(asset.storagePath) : undefined,
         });
-      reader.readAsDataURL(file);
-    } else
-      updateActiveLetterhead({
-        fileName: file.name,
-        fileType: file.type,
-        dataUrl: undefined,
-      });
-    setToast(
-      file.type === "application/pdf"
-        ? "PDF selected. Choose its source page when publishing."
-        : file.type.includes("wordprocessingml")
-          ? "DOCX selected. Header and footer content may need manual adjustment."
-          : "Letterhead image uploaded and applied",
-    );
+      } else if (file.type.startsWith("image/")) {
+        updateActiveLetterhead({
+          fileName: file.name,
+          fileType: file.type,
+          dataUrl: await blobToDataUrl(file),
+          storagePath: undefined,
+        });
+      } else {
+        updateActiveLetterhead({ fileName: file.name, fileType: file.type, dataUrl: undefined, storagePath: undefined });
+      }
+      setToast(
+        file.type === "application/pdf"
+          ? "PDF stored privately. Choose its source page when publishing."
+          : file.type.includes("wordprocessingml")
+            ? "DOCX stored privately. Header and footer content may need manual adjustment."
+            : cloudExpected ? "Letterhead uploaded to private storage and applied" : "Letterhead image uploaded and applied",
+      );
+    } catch (error) {
+      setToast(`Letterhead upload failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
     window.setTimeout(() => setToast(""), 3200);
   };
   const layoutForPage = (pageIndex: number) =>
@@ -3082,8 +3737,8 @@ function WorkspaceApp({
     if (layout.fileType.includes("bmp")) return "bmp" as const;
     return "png" as const;
   };
-  const renderDocxLetterhead = (layout: LetterheadLayout) => {
-    const bytes = dataUrlToBytes(layout.dataUrl);
+  const renderDocxLetterhead = async (layout: LetterheadLayout) => {
+    const bytes = await sourceToBytes(layout.dataUrl);
     const type = letterheadImageType(layout);
     if (bytes && type) {
       return new Paragraph({
@@ -3144,12 +3799,12 @@ function WorkspaceApp({
       const firstLayout = layoutForPage(0);
       const subsequentLayout = layoutForPage(1);
       const firstHeaderChildren = [
-        ...(hasCanvasBlock("letterhead") ? [renderDocxLetterhead(firstLayout)] : []),
+        ...(hasCanvasBlock("letterhead") ? [await renderDocxLetterhead(firstLayout)] : []),
         ...(watermark.placement === "header" ? [renderDocxWatermark(verificationText)] : []),
       ];
       const subsequentHeaderChildren = [
         ...(hasCanvasBlock("letterhead") && letterhead.mode !== "first"
-          ? [renderDocxLetterhead(letterhead.mode === "all" ? firstLayout : subsequentLayout)]
+          ? [await renderDocxLetterhead(letterhead.mode === "all" ? firstLayout : subsequentLayout)]
           : []),
         ...(watermark.placement === "header" ? [renderDocxWatermark(verificationText)] : []),
       ];
@@ -3217,20 +3872,31 @@ function WorkspaceApp({
           children,
         }],
       }));
+      const fileName = `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.docx`;
+      const asset = cloudExpected
+        ? await uploadPrivateAsset(blob, fileName, "export")
+        : null;
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      const fileName = `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.docx`;
       a.download = fileName;
       a.click();
       URL.revokeObjectURL(url);
-      recordExport("docx", "generated", fileName, undefined, await blobToDataUrl(blob));
+      await recordExport(
+        "docx",
+        "generated",
+        fileName,
+        undefined,
+        asset ? undefined : await blobToDataUrl(blob),
+        asset?.storagePath,
+        blob.size,
+      );
       setExportState("idle");
       setToast("Word document exported");
     } catch (error) {
       setExportState("error");
       setExportError(`Word export failed: ${error instanceof Error ? error.message : "Unknown error"}`);
-      recordExport("docx", "failed", `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.docx`, error instanceof Error ? error.message : "Unknown error");
+      await recordExport("docx", "failed", `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.docx`, error instanceof Error ? error.message : "Unknown error").catch(() => undefined);
       setToast("Word export failed. Retry after resolving the error.");
     }
     window.setTimeout(() => setToast(""), 2600);
@@ -3249,13 +3915,20 @@ function WorkspaceApp({
       const pdf = new jsPDF({ format: letterhead.page === "A4" ? "a4" : "letter", unit: "pt" });
       const pageHeight = pdf.internal.pageSize.getHeight();
       const pageWidth = pdf.internal.pageSize.getWidth();
+      const firstLayout = layoutForPage(0);
+      const subsequentLayout = layoutForPage(1);
+      const firstLetterheadData = await sourceToDataUrl(firstLayout.dataUrl);
+      const subsequentLetterheadData = letterhead.mode === "all"
+        ? firstLetterheadData
+        : await sourceToDataUrl(subsequentLayout.dataUrl);
       const addPageFurniture = (pageIndex: number) => {
         const layout = layoutForPage(pageIndex);
         const imageType = letterheadImageType(layout);
+        const layoutData = pageIndex === 0 ? firstLetterheadData : subsequentLetterheadData;
         if (hasCanvasBlock("letterhead")) {
-          if (layout.dataUrl && imageType) {
+          if (layoutData && imageType) {
             const imageHeight = Math.max(24, layout.width * 0.28);
-            pdf.addImage(layout.dataUrl, imageType === "jpg" ? "JPEG" : imageType.toUpperCase(), layout.left, layout.top, layout.width, imageHeight, undefined, "FAST");
+            pdf.addImage(layoutData, imageType === "jpg" ? "JPEG" : imageType.toUpperCase(), layout.left, layout.top, layout.width, imageHeight, undefined, "FAST");
           } else {
             pdf.setFont("helvetica", "bold");
             pdf.setFontSize(10);
@@ -3286,7 +3959,6 @@ function WorkspaceApp({
       };
       let pageIndex = 0;
       addPageFurniture(pageIndex);
-      const firstLayout = layoutForPage(0);
       let y = hasCanvasBlock("letterhead") ? Math.max(70, firstLayout.margin || 74) : 54;
       const ensureSpace = (height: number) => {
         if (y <= pageHeight - height) return;
@@ -3347,15 +4019,26 @@ function WorkspaceApp({
         }
       });
       const fileName = `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.pdf`;
-      const pdfContentBase64 = await blobToDataUrl(pdf.output("blob"));
+      const pdfBlob = pdf.output("blob");
+      const asset = cloudExpected
+        ? await uploadPrivateAsset(pdfBlob, fileName, "export")
+        : null;
       pdf.save(fileName);
-      recordExport("pdf", "generated", fileName, undefined, pdfContentBase64);
+      await recordExport(
+        "pdf",
+        "generated",
+        fileName,
+        undefined,
+        asset ? undefined : await blobToDataUrl(pdfBlob),
+        asset?.storagePath,
+        pdfBlob.size,
+      );
       setExportState("idle");
       setToast("PDF exported");
     } catch (error) {
       setExportState("error");
       setExportError(`PDF export failed: ${error instanceof Error ? error.message : "Unknown error"}`);
-      recordExport("pdf", "failed", `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.pdf`, error instanceof Error ? error.message : "Unknown error");
+      await recordExport("pdf", "failed", `${template.type}_${person.name.replaceAll(" ", "_")}_${formatFileDate()}.pdf`, error instanceof Error ? error.message : "Unknown error").catch(() => undefined);
       setToast("PDF export failed. Retry after resolving the error.");
     }
     window.setTimeout(() => setToast(""), 2600);
@@ -3401,7 +4084,8 @@ function WorkspaceApp({
     updatedAt: formatDocumentStamp(),
     canvasBlocks: clone(canvasBlocks),
   });
-  const persistCurrentDocumentRecord = () => {
+  const persistCurrentDocumentRecord = async () => {
+    setSaving("saving");
     try {
       const record = currentDocumentRecord();
       const next: AppStore = {
@@ -3409,28 +4093,64 @@ function WorkspaceApp({
         navigation: { ...appStore.navigation, module: activeModule, sidebarCollapsed },
         documents: [record, ...appStore.documents.filter((item) => item.id !== record.id)],
       };
-      localStorage.setItem(appStoreKey, JSON.stringify(next));
-      setAppStore(next);
+      const savedStamp = formatDocumentStamp();
+      const payload = makeCloudPayload(savedStamp, {}, next);
+      localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+      localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+      if (cloudExpected && !cloudAvailable) throw new Error("Supabase is unavailable; the local recovery copy was kept.");
+      if (cloudAvailable) await persistCloudPayload(payload);
+      localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+      localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+      setAppStore(payload.appStore);
+      setLastSavedAt(savedStamp);
+      setSaving("saved");
+      setCloudConflict(false);
       return true;
-    } catch {
+    } catch (error) {
+      const conflict = error instanceof CloudStateError && error.code === "STATE_CONFLICT";
+      setCloudConflict(conflict);
       setSaving("error");
-      setModuleNotice("Save failed. Retry or stay on this page.");
+      setModuleNotice(conflict
+        ? "Cloud conflict detected. Reload the cloud version or stay here with the local recovery copy."
+        : `Save failed. Stay here and retry: ${error instanceof Error ? error.message : "Unknown error"}`);
       return false;
     }
   };
-  const signOutOfWorkspace = () => {
-    if (activeModule === "workspace" && !persistCurrentDocumentRecord()) {
+  const signOutOfWorkspace = async () => {
+    if (activeModule === "workspace" && !await persistCurrentDocumentRecord()) {
       setAccountMenuOpen(false);
       return;
     }
     setAccountMenuOpen(false);
     onSignOut();
   };
-  const switchModule = (module: AppModule) => {
+  const switchModule = async (module: AppModule) => {
     if (module === activeModule) return;
-    if (activeModule === "workspace" && !persistCurrentDocumentRecord()) return;
+    if (activeModule === "workspace" && !await persistCurrentDocumentRecord()) return;
     window.location.hash = module;
     setActiveModule(module);
+  };
+  const reloadCloudVersion = async () => {
+    if (!cloudExpected) return;
+    setSaving("saving");
+    try {
+      const result = await loadCloudWorkspace();
+      if (!result.state?.payload) throw new Error("No cloud workspace state is available to reload.");
+      const localBackup = localStorage.getItem(storageKey);
+      if (localBackup) localStorage.setItem(`${storageKey}-conflict-backup-${Date.now()}`, localBackup);
+      cloudRevisionRef.current = result.state.revision;
+      setAppStore(result.state.payload.appStore);
+      applyWorkspaceState(result.state.payload.workspace);
+      localStorage.setItem(appStoreKey, JSON.stringify(result.state.payload.appStore));
+      localStorage.setItem(storageKey, JSON.stringify(result.state.payload.workspace));
+      setCloudAvailable(true);
+      setCloudConflict(false);
+      setSaving("saved");
+      setModuleNotice(`Cloud revision ${result.state.revision} loaded. Your previous local state was backed up.`);
+    } catch (error) {
+      setSaving("error");
+      setModuleNotice(`Cloud reload failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
   };
   const openWorkspaceTool = (
     tab: "outline" | "person" | "placeholders" | "clauses" | "letterhead" | "review",
@@ -3490,15 +4210,84 @@ function WorkspaceApp({
     record.status !== "inactive" &&
     (!workspaceLibrarySearch || record.name.toLowerCase().includes(workspaceLibrarySearch.toLowerCase())),
   );
+  const persistAppStoreChange = async (nextStore: AppStore, successMessage: string) => {
+    const savedStamp = formatDocumentStamp();
+    const payload = makeCloudPayload(savedStamp, {}, nextStore);
+    setSaving("saving");
+    try {
+      localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+      localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+      if (cloudExpected && !cloudAvailable) throw new Error("Supabase is unavailable; the local recovery copy was kept.");
+      if (cloudAvailable) await persistCloudPayload(payload);
+      setAppStore(payload.appStore);
+      setLastSavedAt(savedStamp);
+      setSaving("saved");
+      setCloudConflict(false);
+      setModuleNotice(`${successMessage}${cloudAvailable ? " in Supabase" : " in the local demo workspace"}`);
+      return true;
+    } catch (error) {
+      const conflict = error instanceof CloudStateError && error.code === "STATE_CONFLICT";
+      setCloudConflict(conflict);
+      setSaving("error");
+      setModuleNotice(conflict
+        ? "This library changed in another session. Reload the cloud version before saving."
+        : `Library save failed; your editor remains open: ${error instanceof Error ? error.message : "Unknown error"}`);
+      return false;
+    }
+  };
+  const publishTemplateLayout = async () => {
+    if (currentRole !== "Admin") {
+      setToast("Admin role required to publish template layouts");
+      window.setTimeout(() => setToast(""), 2200);
+      return;
+    }
+    if (!guardEdit()) return;
+    const nextVersion = (templateVersions[templateId] || 1) + 1;
+    const nextTemplateVersions = { ...templateVersions, [templateId]: nextVersion };
+    const nextTemplateLayouts = { ...templateLayouts, [templateId]: clone(letterhead) };
+    const savedStamp = formatDocumentStamp();
+    const payload = makeCloudPayload(savedStamp, {
+      templateVersions: nextTemplateVersions,
+      templateLayouts: nextTemplateLayouts,
+    });
+    setSaving("saving");
+    try {
+      if (cloudExpected && !cloudAvailable) throw new Error("Supabase is unavailable; the template layout was not published.");
+      if (cloudAvailable) await persistCloudPayload(payload);
+      localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+      localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+      setAppStore(payload.appStore);
+      setTemplateVersions(nextTemplateVersions);
+      setTemplateLayouts(nextTemplateLayouts);
+      setLastSavedAt(savedStamp);
+      setSaving("saved");
+      setCloudConflict(false);
+      setToast(`Published ${template.type} layout v${nextVersion}${cloudAvailable ? " in Supabase" : " in the local demo workspace"}`);
+    } catch (error) {
+      const conflict = error instanceof CloudStateError && error.code === "STATE_CONFLICT";
+      setCloudConflict(conflict);
+      setSaving("error");
+      setToast(conflict
+        ? "Template layout was not published. Reload the cloud version before retrying."
+        : `Template layout publish failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+    }
+    window.setTimeout(() => setToast(""), 2800);
+  };
   const updateClauseDraft = (patch: Partial<ClauseRecord>) => setClauseDraft((current) => current ? { ...current, ...patch, updatedAt: formatDocumentStamp() } : current);
-  const saveClauseDraft = (publish = false) => {
+  const saveClauseDraft = async (publish = false) => {
     if (!clauseDraft || currentRole !== "Admin" && publish) return;
-    const nextClause = { ...clauseDraft, status: publish ? "published" : clauseDraft.status, version: clauseDraft.version + (publish ? 1 : 0), updatedAt: formatDocumentStamp() } as ClauseRecord;
-    setAppStore((current) => ({ ...current, clauses: [nextClause, ...current.clauses.filter((item) => item.id !== nextClause.id)] }));
+    const nextVersion = clauseDraft.status === "published" ? clauseDraft.version + 1 : clauseDraft.version;
+    const nextClause = {
+      ...clauseDraft,
+      status: publish ? "published" : "draft",
+      version: nextVersion,
+      updatedAt: formatDocumentStamp(),
+    } as ClauseRecord;
+    const nextStore = { ...appStore, clauses: [nextClause, ...appStore.clauses.filter((item) => item.id !== nextClause.id)] };
+    if (!await persistAppStoreChange(nextStore, publish ? "Clause published and saved" : "Clause draft saved")) return;
     setSelectedClauseRecordId(nextClause.id);
     setClauseDraft(null);
     setModuleDrawer(null);
-    setModuleNotice(publish ? "Clause published for new documents" : "Clause draft saved");
   };
   const openClauseEditor = (record?: ClauseRecord) => {
     const next = record ? clone(record) : {
@@ -3525,14 +4314,17 @@ function WorkspaceApp({
       updateClauseDraft({ subsections: clauseDraft.subsections.map((sub) => sub.id === subsectionId ? { ...sub, contents: [...sub.contents, item] } : sub) });
     } else updateClauseDraft({ contents: [...clauseDraft.contents, item] });
   };
-  const copyClauseRecord = (record: ClauseRecord) => {
+  const copyClauseRecord = async (record: ClauseRecord) => {
     const copy = { ...clone(record), id: `clause-${Date.now()}`, title: `${record.title} copy`, status: "draft" as const, version: 1, updatedAt: formatDocumentStamp() };
-    setAppStore((current) => ({ ...current, clauses: [copy, ...current.clauses] }));
-    setModuleNotice("Clause copied as a draft");
+    await persistAppStoreChange({ ...appStore, clauses: [copy, ...appStore.clauses] }, "Clause copied and saved as a draft");
   };
-  const toggleClauseStatus = (record: ClauseRecord) => {
+  const toggleClauseStatus = async (record: ClauseRecord) => {
     if (currentRole !== "Admin") return setModuleNotice("Admin role required to change clause status");
-    setAppStore((current) => ({ ...current, clauses: current.clauses.map((item) => item.id === record.id ? { ...item, status: item.status === "inactive" ? "published" : "inactive", updatedAt: formatDocumentStamp() } : item) }));
+    const nextStatus = record.status === "inactive" ? "published" : "inactive";
+    await persistAppStoreChange({
+      ...appStore,
+      clauses: appStore.clauses.map((item) => item.id === record.id ? { ...item, status: nextStatus, updatedAt: formatDocumentStamp() } : item),
+    }, `Clause ${nextStatus === "inactive" ? "deactivated" : "reactivated"}`);
   };
   const openPlaceholderEditor = (group?: PlaceholderGroup) => {
     setPlaceholderDraft(group ? clone(group) : { id: `group-${Date.now()}`, name: "New placeholder group", sourceType: "Manual", sourceTable: "custom_fields", fields: [], status: "active" });
@@ -3561,25 +4353,29 @@ function WorkspaceApp({
     setImportPreview(null);
     setModuleNotice("Imported fields added to this placeholder group. Review and save the group.");
   };
-  const savePlaceholderDraft = () => {
+  const savePlaceholderDraft = async () => {
     if (!placeholderDraft) return;
-    setAppStore((current) => ({ ...current, placeholderGroups: [placeholderDraft, ...current.placeholderGroups.filter((item) => item.id !== placeholderDraft.id)] }));
+    const nextStore = { ...appStore, placeholderGroups: [placeholderDraft, ...appStore.placeholderGroups.filter((item) => item.id !== placeholderDraft.id)] };
+    if (!await persistAppStoreChange(nextStore, "Placeholder group saved")) return;
     setSelectedPlaceholderGroupId(placeholderDraft.id);
     setPlaceholderDraft(null);
     setModuleDrawer(null);
-    setModuleNotice("Placeholder group saved");
   };
   const openLayoutEditor = (record?: LayoutRecord) => {
     setLayoutDraft(record ? clone(record) : { id: `layout-${Date.now()}`, name: "New letterhead", companyId, letterhead: makeDefaultLetterhead(), status: "draft", updatedAt: formatDocumentStamp() });
     setModuleDrawer("layout");
   };
-  const saveLayoutDraft = (publish = false) => {
+  const saveLayoutDraft = async (publish = false) => {
     if (!layoutDraft) return;
-    const next = { ...layoutDraft, status: publish ? "published" : layoutDraft.status, updatedAt: formatDocumentStamp() } as LayoutRecord;
-    setAppStore((current) => ({ ...current, layouts: [next, ...current.layouts.filter((item) => item.id !== next.id)] }));
+    const next = { ...layoutDraft, status: publish ? "published" : "draft", updatedAt: formatDocumentStamp() } as LayoutRecord;
+    const nextStore = { ...appStore, layouts: [next, ...appStore.layouts.filter((item) => item.id !== next.id)] };
+    if (!await persistAppStoreChange(nextStore, publish ? "Layout published and saved" : "Layout saved")) return;
     setLayoutDraft(null);
     setModuleDrawer(null);
-    setModuleNotice(publish ? "Layout published" : "Layout saved");
+  };
+  const copyLayoutRecord = async (record: LayoutRecord) => {
+    const copy = { ...clone(record), id: `layout-${Date.now()}`, name: `${record.name} copy`, status: "draft" as const, updatedAt: formatDocumentStamp() };
+    await persistAppStoreChange({ ...appStore, layouts: [copy, ...appStore.layouts] }, "Layout copied and saved as a draft");
   };
   const applyLayoutRecord = (record: LayoutRecord) => {
     if (!guardEdit()) return;
@@ -3615,7 +4411,15 @@ function WorkspaceApp({
     setModuleNotice(`${record.title} inserted as a document copy`);
     switchModule("workspace");
   };
-  const recordExport = (format: ExportRecord["format"], status: ExportRecord["status"], fileName: string, error?: string, contentBase64?: string) => {
+  const recordExport = async (
+    format: ExportRecord["format"],
+    status: ExportRecord["status"],
+    fileName: string,
+    error?: string,
+    contentBase64?: string,
+    storagePath?: string,
+    byteSize?: number,
+  ) => {
     const exportRecord: ExportRecord = {
       id: `export-${Date.now()}-${format}`,
       documentId: "doc-current",
@@ -3625,31 +4429,49 @@ function WorkspaceApp({
       fileName,
       createdAt: formatDocumentStamp(),
       contentBase64,
+      storagePath,
+      byteSize,
       error,
     };
-    setAppStore((current) => {
-      const existing = current.documents.find((item) => item.id === "doc-current") || currentDocumentRecord();
-      const nextDocument: DocumentRecord = {
-        ...existing,
-        sections: clone(sections),
-        values: clone(values),
-        letterhead: clone(letterhead),
-        watermark: clone(watermark),
-        docName,
-        templateId,
-        personId,
-        status: docStatus === "In review" ? "in-review" : docStatus === "Approved" ? "approved" : "draft",
-        generationStatus: status === "generated" ? "generated" : "failed",
-        exports: status === "failed" ? existing.exports : [exportRecord, ...existing.exports],
-        updatedAt: formatDocumentStamp(),
-        canvasBlocks: clone(canvasBlocks),
-      };
-      return { ...current, exports: [exportRecord, ...current.exports], documents: [nextDocument, ...current.documents.filter((item) => item.id !== "doc-current")] };
-    });
+    const existing = appStore.documents.find((item) => item.id === "doc-current") || currentDocumentRecord();
+    const nextDocument: DocumentRecord = {
+      ...existing,
+      sections: clone(sections),
+      values: clone(values),
+      letterhead: clone(letterhead),
+      watermark: clone(watermark),
+      docName,
+      templateId,
+      personId,
+      status: docStatus === "In review" ? "in-review" : docStatus === "Approved" ? "approved" : "draft",
+      generationStatus: status === "generated" ? "generated" : "failed",
+      exports: [exportRecord, ...existing.exports],
+      updatedAt: formatDocumentStamp(),
+      canvasBlocks: clone(canvasBlocks),
+    };
+    const nextStore: AppStore = {
+      ...appStore,
+      exports: [exportRecord, ...appStore.exports],
+      documents: [nextDocument, ...appStore.documents.filter((item) => item.id !== "doc-current")],
+    };
+    const savedStamp = formatDocumentStamp();
+    const payload = makeCloudPayload(savedStamp, {}, nextStore);
+    localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+    localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+    if (cloudExpected && !cloudAvailable) throw new Error("Supabase is unavailable; the generated file record could not be committed.");
+    if (cloudAvailable) await persistCloudPayload(payload);
+    localStorage.setItem(appStoreKey, JSON.stringify(payload.appStore));
+    localStorage.setItem(storageKey, JSON.stringify(payload.workspace));
+    setAppStore(payload.appStore);
+    setLastSavedAt(savedStamp);
   };
   const formatDocStatus = (status: DocumentRecord["status"]) => status === "in-review" ? "In review" : status.charAt(0).toUpperCase() + status.slice(1);
   const downloadStoredExport = (record: DocumentRecord, format: ExportRecord["format"]) => {
-    const exportRecord = record.exports.find((item) => item.format === format && item.status === "generated" && item.contentBase64);
+    const exportRecord = record.exports.find((item) => item.format === format && item.status === "generated" && (item.storagePath || item.contentBase64));
+    if (exportRecord?.storagePath) {
+      window.location.assign(assetFileUrl(exportRecord.storagePath, true));
+      return;
+    }
     if (!exportRecord?.contentBase64) {
       setModuleNotice(`No stored ${format.toUpperCase()} file is available. Regenerate from Workspace.`);
       return;
@@ -4213,7 +5035,7 @@ function WorkspaceApp({
       return <section className="module-page"><div className="module-header"><div><span className="eyebrow">DATA MODEL</span><h1>Placeholder Management</h1><p>Map reusable fields to onboarding and company records with stable IDs.</p></div><button className="primary-btn" onClick={() => openPlaceholderEditor()}><Plus size={15} /> New group</button></div><div className="split-module"><aside className="module-list">{appStore.placeholderGroups.map((group) => <button className={selectedGroup?.id === group.id ? "selected" : ""} key={group.id} onClick={() => setSelectedPlaceholderGroupId(group.id)}><span>{group.name}</span><small>{group.fields.length} fields · {group.sourceType}</small></button>)}</aside><div className="module-detail">{selectedGroup ? <><div className="detail-heading"><div><h2>{selectedGroup.name}</h2><span>{selectedGroup.sourceType} · {selectedGroup.sourceTable}</span></div><div className="row-actions"><button className="outline-btn" onClick={() => openPlaceholderEditor(selectedGroup)}><Settings2 size={14} /> Edit group</button><button className="primary-btn" onClick={() => { setPlaceholderDraft(clone(selectedGroup)); addPlaceholderField(); setModuleDrawer("placeholder"); }}><Plus size={14} /> Add field</button></div></div><div className="field-table"><div className="field-table-head"><span>Name</span><span>Placeholder</span><span>Type</span><span>Source</span><span>Example</span><span>Status</span></div>{selectedGroup.fields.map((field) => <div className="field-table-row" key={field.id}><strong>{field.label}</strong><code>{`{{${selectedGroup.name}.${field.label}}}`}</code><span>{field.type}</span><span>{field.sourceField || "Manual"}</span><span>{field.example}</span><span className={`status-pill ${field.mappingStatus === "valid" ? "published" : "inactive"}`}>{field.mappingStatus === "valid" ? "Connected" : "Mapping invalid"}</span></div>)}</div></> : <div className="empty-state"><Sparkles size={18} /> Create a placeholder group to get started.</div>}</div></div></section>;
     }
     if (activeModule === "layouts") {
-      return <section className="module-page"><div className="module-header"><div><span className="eyebrow">PAGE SYSTEM</span><h1>Layout Management</h1><p>Keep company letterheads and page safety settings reusable, previewable, and versioned.</p></div><div className="row-actions"><button className="outline-btn" onClick={() => openLayoutEditor()}><Plus size={15} /> Create letterhead</button><button className="primary-btn" onClick={() => { letterheadInputRef.current?.click(); }}><Upload size={15} /> Upload existing</button></div></div><div className="layout-grid">{appStore.layouts.map((record) => <article className="layout-card" key={record.id}><div className="layout-thumb" style={{ borderTopColor: record.letterhead.accent }}><div className="layout-thumb-brand"><span style={{ background: record.letterhead.accent }}>N</span><strong>{values.company_name || "Northstar Labs"}</strong></div><div className="layout-thumb-lines" /></div><div className="layout-card-body"><div><strong>{record.name}</strong><small>{record.letterhead.page} · {record.status} · updated {record.updatedAt}</small></div><div className="row-actions"><button className="icon-btn" title="Apply to workspace" onClick={() => { applyLayoutRecord(record); switchModule("workspace"); }}><Check size={14} /></button><button className="icon-btn" title="Edit" onClick={() => openLayoutEditor(record)}><Settings2 size={14} /></button><button className="icon-btn" title="Copy" onClick={() => setAppStore((current) => ({ ...current, layouts: [{ ...clone(record), id: `layout-${Date.now()}`, name: `${record.name} copy`, status: "draft" }, ...current.layouts] }))}><Copy size={14} /></button></div></div></article>)}</div></section>;
+      return <section className="module-page"><div className="module-header"><div><span className="eyebrow">PAGE SYSTEM</span><h1>Layout Management</h1><p>Keep company letterheads and page safety settings reusable, previewable, and versioned.</p></div><div className="row-actions"><button className="outline-btn" onClick={() => openLayoutEditor()}><Plus size={15} /> Create letterhead</button><button className="primary-btn" onClick={() => { letterheadInputRef.current?.click(); }}><Upload size={15} /> Upload existing</button></div></div><div className="layout-grid">{appStore.layouts.map((record) => <article className="layout-card" key={record.id}><div className="layout-thumb" style={{ borderTopColor: record.letterhead.accent }}><div className="layout-thumb-brand"><span style={{ background: record.letterhead.accent }}>N</span><strong>{values.company_name || "Northstar Labs"}</strong></div><div className="layout-thumb-lines" /></div><div className="layout-card-body"><div><strong>{record.name}</strong><small>{record.letterhead.page} · {record.status} · updated {record.updatedAt}</small></div><div className="row-actions"><button className="icon-btn" title="Apply to workspace" onClick={() => { applyLayoutRecord(record); switchModule("workspace"); }}><Check size={14} /></button><button className="icon-btn" title="Edit" onClick={() => openLayoutEditor(record)}><Settings2 size={14} /></button><button className="icon-btn" title="Copy" onClick={() => void copyLayoutRecord(record)}><Copy size={14} /></button></div></div></article>)}</div></section>;
     }
     if (activeModule === "documents") {
       const docs = appStore.documents.filter((doc) => {
@@ -4436,8 +5258,8 @@ function WorkspaceApp({
               : saving === "error"
                 ? "Save failed"
                 : lastSavedAt
-                  ? `Saved ${lastSavedAt}`
-                  : "Saved locally"}
+                  ? `${cloudAvailable ? "Cloud saved" : "Saved locally"} ${lastSavedAt}`
+                  : cloudExpected ? "Connecting to Supabase…" : "Saved locally"}
           </div>
           <button
             className="icon-btn"
@@ -4468,31 +5290,7 @@ function WorkspaceApp({
                   ? "Approved documents are locked; restore as a new draft to submit changes"
                   : undefined
             }
-            onClick={() => {
-              if (blockingIssues.length) {
-                setToast("Fix the highlighted checks before review");
-                window.setTimeout(() => setToast(""), 2400);
-                goToWorkflowStage("review");
-                return;
-              }
-              if (docStatus === "Approved") return;
-              if (docStatus === "In review" && currentRole !== "Reviewer") {
-                goToWorkflowStage("review");
-                return;
-              }
-              if (currentRole === "Reviewer" && docStatus === "In review") {
-                setDocStatus("Approved");
-                setWorkflowStage("export");
-                createVersion("Approved by reviewer", "Approved");
-                setToast("Document approved and version locked");
-              } else {
-                setDocStatus("In review");
-                setWorkflowStage("review");
-                createVersion("Submitted for review", "In review");
-                setToast("Sent for review");
-              }
-              window.setTimeout(() => setToast(""), 2200);
-            }}
+            onClick={() => void transitionDocumentStatus()}
           >
             <ShieldCheck size={15} />
             {primaryActionLabel}
@@ -4500,12 +5298,16 @@ function WorkspaceApp({
           <div className="role-switch-wrap">
             <button
               className="avatar role-avatar"
-              title="Switch workspace role"
-              onClick={() => setRoleMenuOpen((open) => !open)}
+              title={cloudExpected ? `Assigned workspace role: ${currentRole}` : "Switch demo workspace role"}
+              aria-label={cloudExpected ? `Assigned workspace role: ${currentRole}` : "Switch demo workspace role"}
+              onClick={() => {
+                if (cloudExpected) return;
+                setRoleMenuOpen((open) => !open);
+              }}
             >
               {currentRole.slice(0, 1)}
             </button>
-            {roleMenuOpen && (
+            {roleMenuOpen && !cloudExpected && (
               <div className="role-menu" role="menu">
                 {(["Admin", "Editor", "Reviewer"] as UserRole[]).map((role) => (
                   <button
@@ -4735,40 +5537,84 @@ function WorkspaceApp({
               >
                 Aptos <ChevronDown size={13} />
               </button>
-              <button
-                className="toolbar-select size-select"
-                onMouseDown={toolbarMouseDown}
-                onClick={() => {
-                  const next = fontSize === 11 ? 13 : fontSize === 13 ? 16 : 11;
-                  const applied = applyEditorCommand(
-                    "fontSize",
-                    next === 11 ? "2" : next === 13 ? "3" : "4",
-                  );
-                  if (applied) setFontSize(next);
-                }}
-              >
-                {fontSize}
-                <ChevronDown size={13} />
-              </button>
+              <div className="font-size-control">
+                <button
+                  className="toolbar-select size-select"
+                  type="button"
+                  aria-label="Font size for selected text"
+                  aria-haspopup="listbox"
+                  aria-expanded={Boolean(fontSizeMenu)}
+                  title="Font size for selected text"
+                  onMouseDown={(event) => {
+                    rememberSelection();
+                    preserveEditorSelectionRef.current = true;
+                    toolbarMouseDown(event);
+                  }}
+                  onClick={(event) => {
+                    if (fontSizeMenu) {
+                      preserveEditorSelectionRef.current = false;
+                      setFontSizeMenu(null);
+                      return;
+                    }
+                    const bounds = event.currentTarget.getBoundingClientRect();
+                    setFontSizeMenu({
+                      top: bounds.bottom + 6,
+                      left: Math.min(bounds.left, window.innerWidth - 184),
+                    });
+                  }}
+                >
+                  <span>{fontSize}</span>
+                  <ChevronDown size={12} />
+                </button>
+                {fontSizeMenu &&
+                  createPortal(
+                    <div
+                      className="font-size-menu"
+                      role="listbox"
+                      aria-label="Choose font size"
+                      style={{
+                        top: fontSizeMenu.top,
+                        left: fontSizeMenu.left,
+                      }}
+                    >
+                      {EDITOR_FONT_SIZES.map((size) => (
+                        <button
+                          key={size}
+                          type="button"
+                          role="option"
+                          aria-selected={fontSize === size}
+                          className={fontSize === size ? "selected" : ""}
+                          onMouseDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                          }}
+                          onClick={() => {
+                            applySelectedFontSize(size);
+                            setFontSizeMenu(null);
+                          }}
+                        >
+                          {size}
+                        </button>
+                      ))}
+                    </div>,
+                    document.body,
+                  )}
+              </div>
               <button
                 className="toolbar-btn"
-                title="Increase selected text"
+                title="Increase selected text size"
+                aria-label="Increase selected text size"
                 onMouseDown={toolbarMouseDown}
-                onClick={() => {
-                  const applied = applyEditorCommand("fontSize", "4");
-                  if (applied) setFontSize((v) => Math.min(24, v + 2));
-                }}
+                onClick={() => stepSelectedFontSize(1)}
               >
                 <ArrowUp size={14} />
               </button>
               <button
                 className="toolbar-btn"
-                title="Decrease selected text"
+                title="Decrease selected text size"
+                aria-label="Decrease selected text size"
                 onMouseDown={toolbarMouseDown}
-                onClick={() => {
-                  const applied = applyEditorCommand("fontSize", "2");
-                  if (applied) setFontSize((v) => Math.max(9, v - 2));
-                }}
+                onClick={() => stepSelectedFontSize(-1)}
               >
                 <ArrowDown size={14} />
               </button>
@@ -5599,19 +6445,9 @@ function WorkspaceApp({
                 <p className="watermark-note">The displayed timestamp is captured when each file is exported.</p>
               </div>
               <div className="button-stack">
-                <button className="add-field" disabled={currentRole !== "Admin" || !canEditDocument} onClick={() => {
-                  if (currentRole !== "Admin") {
-                    setToast("Admin role required to publish template layouts");
-                    window.setTimeout(() => setToast(""), 2200);
-                    return;
-                  }
-                  if (!guardEdit()) return;
-                  setTemplateVersions((prev) => ({ ...prev, [templateId]: (prev[templateId] || 0) + 1 }));
-                  setToast(`Published ${template.type} layout v${(templateVersions[templateId] || 0) + 1}`);
-                  window.setTimeout(() => setToast(""), 2400);
-                }}>
+                <button className="add-field" disabled={currentRole !== "Admin" || !canEditDocument} onClick={() => void publishTemplateLayout()}>
                   <Save size={14} />
-                  Publish template layout v{(templateVersions[templateId] || 0) + 1}
+                  Publish template layout v{(templateVersions[templateId] || 1) + 1}
                 </button>
               <button className="text-btn" onClick={() => { setModuleNotice("Current document keeps this layout independently"); }}><Check size={13} /> Save only to current document</button>
               <button
@@ -5736,7 +6572,7 @@ function WorkspaceApp({
       {activeModule === "placeholders" && <button className="module-import-float" onClick={() => { openPlaceholderEditor(); window.setTimeout(() => placeholderImportInputRef.current?.click(), 0); }}><Upload size={14} /> Import CSV / Excel</button>}
       {importPreview && activeModule === "placeholders" && <div className="import-preview-panel"><div><span className="eyebrow">SOURCE PREVIEW</span><h3>{importPreview.fileName}</h3><p>{importPreview.headers.length} fields detected · first three records shown</p></div><div className="import-preview-fields">{importPreview.headers.slice(0, 8).map((header) => <code key={header}>{header}</code>)}</div><div className="row-actions"><button className="outline-btn" onClick={() => setImportPreview(null)}>Cancel</button><button className="primary-btn" onClick={confirmPlaceholderImport}><Check size={14} /> Use detected fields</button></div></div>}
       {renderModuleDrawer()}
-      {moduleNotice && <div className="module-notice" role="status"><CheckCircle2 size={15} />{moduleNotice}<button className="icon-btn" onClick={() => setModuleNotice("")}><X size={13} /></button></div>}
+      {moduleNotice && <div className={`module-notice ${saving === "error" ? "error" : ""}`} role={saving === "error" ? "alert" : "status"}>{saving === "error" ? <AlertTriangle size={15} /> : <CheckCircle2 size={15} />}<span>{moduleNotice}</span>{cloudConflict && <button className="outline-btn" onClick={() => void reloadCloudVersion()}><RefreshCw size={13} /> Reload cloud</button>}<button className="icon-btn" aria-label="Dismiss message" onClick={() => setModuleNotice("")}><X size={13} /></button></div>}
       {showPreview && (
         <div className="modal-backdrop" onClick={() => setShowPreview(false)}>
           <div className="preview-modal" onClick={(e) => e.stopPropagation()}>

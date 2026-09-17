@@ -7,6 +7,11 @@ export type ApiErrorCode =
   | "AUTH_REQUIRED"
   | "FORBIDDEN"
   | "BACKEND_NOT_CONFIGURED"
+  | "STATE_NOT_FOUND"
+  | "STATE_CONFLICT"
+  | "STATE_TOO_LARGE"
+  | "APPROVED_DOCUMENT_IMMUTABLE"
+  | "SCHEMA_VERSION_UNSUPPORTED"
   | "CONNECTION_NOT_FOUND"
   | "RATE_LIMITED"
   | "OAUTH_ERROR"
@@ -59,6 +64,6 @@ export const handleApiError = (response: VercelResponse, error: unknown) => {
   return json(response, 500, {
     ok: false,
     code: "BACKEND_NOT_CONFIGURED",
-    error: "The email connection service could not complete this request.",
+    error: "The cloud service could not complete this request.",
   });
 };

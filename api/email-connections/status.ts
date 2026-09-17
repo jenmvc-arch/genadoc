@@ -4,6 +4,7 @@ import { platformConfiguration } from "../_lib/config.js";
 import { publicConnection } from "../_lib/connection.js";
 import { findEmailConnection } from "../_lib/database.js";
 import { handleApiError, json, requireMethod } from "../_lib/http.js";
+import { requireWorkspaceAccess } from "../_lib/workspace-store.js";
 
 export default async function handler(request: VercelRequest, response: VercelResponse) {
   try {
@@ -22,6 +23,7 @@ export default async function handler(request: VercelRequest, response: VercelRe
       });
     }
     const session = requireSession(request);
+    await requireWorkspaceAccess(session);
     const connection = await findEmailConnection(session.userId, session.workspaceId);
     return json(response, 200, {
       ok: true,

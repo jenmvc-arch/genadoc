@@ -5,6 +5,7 @@ import { encryptCredential } from "../../_lib/crypto.js";
 import { upsertEmailConnection } from "../../_lib/database.js";
 import { ApiError, handleApiError, requireMethod } from "../../_lib/http.js";
 import { verifyOAuthState } from "../../_lib/oauth-state.js";
+import { requireWorkspaceAccess } from "../../_lib/workspace-store.js";
 
 type TokenResponse = {
   access_token?: string;
@@ -25,6 +26,8 @@ export default async function handler(request: VercelRequest, response: VercelRe
     if (!code || !stateValue) throw new ApiError(400, "OAUTH_ERROR", "Google did not return a valid authorization response.");
     const state = verifyOAuthState(stateValue);
     const session = requireSession(request);
+    const role = await requireWorkspaceAccess(session);
+    if (role === "Reviewer") throw new ApiError(403, "FORBIDDEN", "Reviewers cannot manage email connections.");
     if (session.userId !== state.userId || session.workspaceId !== state.workspaceId) {
       throw new ApiError(403, "FORBIDDEN", "This Google connection belongs to a different signed-in workspace session.");
     }

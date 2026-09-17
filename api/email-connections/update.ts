@@ -3,6 +3,7 @@ import { requireSession } from "../_lib/auth.js";
 import { publicConnection } from "../_lib/connection.js";
 import { updateEmailPreferences } from "../_lib/database.js";
 import { ApiError, handleApiError, json, parseBody, requireMethod } from "../_lib/http.js";
+import { requireWorkspaceAccess } from "../_lib/workspace-store.js";
 
 type Input = {
   senderName?: string;
@@ -18,7 +19,8 @@ export default async function handler(request: VercelRequest, response: VercelRe
   try {
     requireMethod(request, ["PATCH", "POST"]);
     const session = requireSession(request);
-    if (session.role === "Reviewer") throw new ApiError(403, "FORBIDDEN", "Reviewers cannot change email delivery settings.");
+    const role = await requireWorkspaceAccess(session);
+    if (role === "Reviewer") throw new ApiError(403, "FORBIDDEN", "Reviewers cannot change email delivery settings.");
     const input = parseBody<Input>(request);
     const senderName = String(input.senderName || "").trim();
     if (!senderName) throw new ApiError(400, "INVALID_REQUEST", "Enter the sender name recipients should see.");
